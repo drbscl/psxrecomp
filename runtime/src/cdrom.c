@@ -2327,6 +2327,11 @@ static void exec_command(uint8_t cmd) {
             set_irq(CDIRQ_ERROR);
             break;
         }
+        /* A seek interrupts an active data read. Keeping `reading` set lets a
+         * later ReadN mistake the old stream for a continuation after seek
+         * completion clears setloc_pending, so it resumes at the pre-seek MSF
+         * instead of the SetLoc target. */
+        stop_read_stream();
         xa_reset_decode();
         spu_cd_audio_reset();
         stop_cdda_playback();
