@@ -692,8 +692,14 @@ void dirty_ram_reset_for_boot(void) {
     memset(text_modified_bitmap, 0, sizeof(text_modified_bitmap));
     memset(text_diverged_bitmap, 0, sizeof(text_diverged_bitmap));
     g_text_diverged_pages = 0;
-    memset(overlay_watch_bitmap, 0, sizeof(overlay_watch_bitmap));
-    memset(overlay_page_gen, 0, sizeof(overlay_page_gen));
+    /* Watches describe loaded/cache-manifest dependencies, not guest RAM.
+     * The cache worker runs before memory_init on cold boot, and DLL owners
+     * also survive a session reboot. Dropping their watches strands INVALID
+     * lazy identities after streamed writes (a rescan used to mask this).
+     * Preserve subscriptions and advance generations so pre-reset validation
+     * cannot survive replacement of RAM. */
+    for (uint32_t pg = 0; pg < DIRTY_RAM_PAGE_COUNT; pg++)
+        overlay_page_gen[pg]++;
     memset(g_dirty_ram_exec_page_bitmap, 0, sizeof(g_dirty_ram_exec_page_bitmap));
     memset(g_dirty_ram_exec_pc_bitmap, 0, sizeof(g_dirty_ram_exec_pc_bitmap));
     memset(g_dirty_ram_dispatch_pc_bitmap, 0,

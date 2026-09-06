@@ -213,6 +213,18 @@ on a fixed region -> next.
 
 ## 5. Status / Log (update every session)
 
+### 2026-09-06 — Project Phantasma dispatch/yaw observability
+
+Completed opt-in `overlay_dispatch_probe` safe-point command, bounded 128-event
+exact/range/native/interpreter recorder and loader publication-path attribution.
+This adds host diagnostics only, not a timing/gameplay/selection fix. Isolated
+ASan/UBSan loader/command and yaw tests passed; full debug-server/interpreter
+translation units syntax-checked. No shared-game build, TCP capture, input,
+restart or debugger attach during concurrent campaign automation. Live yaw cause
+remains unproven. See the parent game's `docs/YAW_DISPATCH_DIAGNOSTICS.md` for
+wire commands, static CPS findings, bounds and integration prerequisites.
+
+
 - **2026-07-28 (per-game host audio cushion — implemented, parser validated):**
   Added `[audio] buffer_ms` as a runtime-only developer setting with a guarded
   30–500 ms range. The compatibility default remains 180 ms, preserving the

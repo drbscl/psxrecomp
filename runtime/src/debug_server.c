@@ -20,6 +20,7 @@
 #include "nd_intro_ot.h"
 #include "latency_ring.h"
 #include "overlay_loader.h"
+#include "overlay_dispatch_probe.h"
 #include "overlay_capture.h"
 #include "code_provider.h"
 #include "overlay_backend.h"
@@ -12483,6 +12484,105 @@ static void handle_overlay_native_block(int id, const char *json)
     send_fmt("%s", buf);
 }
 
+/* Dispatch probe command helpers. Keep numeric validation local: the legacy
+ * json_get_* helpers accept truncated strings / partial numbers. Here malformed
+ * requests must not silently reset an in-flight diagnostic capture.
+ * Return 0=absent, 1=valid, -1=invalid. Quoted 0x hex or decimal; bare decimal. */
+static int dispatch_probe_u32(const char *json, const char *key, uint32_t *out)
+{
+    char pattern[32];
+    snprintf(pattern, sizeof(pattern), "\"%s\"", key);
+    const char *p = strstr(json, pattern);
+    if (!p) return 0;
+    p += strlen(pattern);
+    p += strspn(p, " \t\r\n");
+    if (*p++ != ':') return -1;
+    p += strspn(p, " \t\r\n");
+    int quoted = (*p == '"');
+    if (quoted) p++;
+    unsigned base = 10, digits = 0;
+    if (quoted && p[0] == '0' && (p[1] == 'x' || p[1] == 'X')) {
+        base = 16; p += 2;
+    }
+    uint32_t value = 0;
+    for (;;) {
+        unsigned d;
+        if (*p >= '0' && *p <= '9') d = (unsigned)(*p - '0');
+        else if (base == 16 && *p >= 'a' && *p <= 'f') d = (unsigned)(*p - 'a' + 10);
+        else if (base == 16 && *p >= 'A' && *p <= 'F') d = (unsigned)(*p - 'A' + 10);
+        else break;
+        if (value > (UINT32_MAX - d) / base) return -1;
+        value = value * base + d; p++; digits++;
+    }
+    if (!digits) return -1;
+    if (quoted && *p++ != '"') return -1;
+    p += strspn(p, " \t\r\n");
+    if (*p != ',' && *p != '}') return -1;
+    /* Duplicate control fields are ambiguous, even if their values agree. */
+    if (strstr(p, pattern)) return -1;
+    *out = value;
+    return 1;
+}
+
+/* Runs ONLY through the regular emulation-thread safe-point command table,
+ * never the TCP ping fast path. Reads host diagnostic state, not guest RAM. */
+static void handle_overlay_dispatch_probe(int id, const char *json)
+{
+    uint32_t lo = 0, hi = 0, off = 0, count = OVERLAY_DISPATCH_PROBE_CAP;
+    int has_lo = dispatch_probe_u32(json, "lo", &lo);
+    int has_hi = dispatch_probe_u32(json, "hi", &hi);
+    int has_off = dispatch_probe_u32(json, "off", &off);
+    int has_count = dispatch_probe_u32(json, "count", &count);
+    if (has_lo < 0 || has_hi < 0 || has_off < 0 || has_count < 0 ||
+        has_lo != has_hi || off > 1 || (has_lo && has_off) ||
+        count < 1 || count > OVERLAY_DISPATCH_PROBE_CAP ||
+        (has_lo && ((lo & 0x1fffffffu) > (hi & 0x1fffffffu) || (!lo && !hi)))) {
+        send_err(id, "expected lo+hi inclusive u32 range, or off:1; count:1..128");
+        return;
+    }
+    /* Allocate before altering even diagnostic state. Bounds include 6x JSON
+     * expansion of the loader's at-most-767-byte publication path per row. */
+    const size_t cap = 512 + OVERLAY_DISPATCH_PROBE_CAP * 5200;
+    char *out = (char *)malloc(cap);
+    if (!out) { send_err(id, "alloc failed"); return; }
+    if (has_lo) overlay_loader_dispatch_probe_set(lo, hi);
+    else if (off) overlay_loader_dispatch_probe_set(0, 0);
+    OverlayDispatchProbe rows[OVERLAY_DISPATCH_PROBE_CAP];
+    uint64_t total;
+    int n = overlay_loader_dispatch_probe_get(rows, (int)count, &total);
+    size_t pos = 0;
+    int w = snprintf(out, cap,
+        "{\"id\":%d,\"ok\":true,\"enabled\":%s,\"total\":%llu,\"count\":%d,\"records\":[",
+        id, g_overlay_dispatch_probe_enabled ? "true" : "false",
+        (unsigned long long)total, n);
+    if (w < 0 || (size_t)w >= cap) goto overflow;
+    pos = (size_t)w;
+    for (int i = 0; i < n; i++) {
+        const OverlayDispatchProbe *r = &rows[i];
+        char path[768 * 6 + 1];
+        json_escape_string(path, sizeof(path), overlay_loader_dispatch_probe_path(r->candidate));
+        w = snprintf(out + pos, cap - pos,
+            "%s{\"seq\":%llu,\"event\":\"%s\",\"addr\":\"0x%08X\","
+            "\"pc\":\"0x%08X\",\"a0\":\"0x%08X\",\"s0\":\"0x%08X\","
+            "\"ra\":\"0x%08X\",\"candidate\":%d,\"dll\":%d,\"tier\":%d,"
+            "\"state\":%d,\"owner\":\"0x%08X\",\"crc\":\"0x%08X\",\"path\":\"%s\"}",
+            i ? "," : "", (unsigned long long)r->seq, r->event,
+            r->addr, r->pc, r->a0, r->s0, r->ra, r->candidate, r->dll,
+            r->tier, r->state, r->owner, r->crc, path);
+        if (w < 0 || (size_t)w >= cap - pos) goto overflow;
+        pos += (size_t)w;
+    }
+    w = snprintf(out + pos, cap - pos, "]}");
+    if (w < 0 || (size_t)w >= cap - pos) goto overflow;
+    /* Already formatted and bounded: avoid another formatting allocation. */
+    debug_server_send_line(out);
+    free(out);
+    return;
+overflow:
+    free(out);
+    send_err(id, "dispatch probe response overflow");
+}
+
 /* overlay_cps_probe: arm/dump the CPS interior-continuation dispatch probe.
  *   {"cmd":"overlay_cps_probe","addr":"0x80050B30"} -> arm for that PC
  *   {"cmd":"overlay_cps_probe"}                     -> dump last decision
@@ -13678,6 +13778,7 @@ static const CmdEntry s_commands[] = {
     { "overlay_native_on",    handle_overlay_native_on },
     { "overlay_native_off",   handle_overlay_native_off },
     { "overlay_native_block", handle_overlay_native_block },
+    { "overlay_dispatch_probe", handle_overlay_dispatch_probe },
     { "overlay_cps_probe",    handle_overlay_cps_probe },
     { "overlay_capture_dump", handle_overlay_capture_dump },
     { "cdrom_instant_rate",   handle_cdrom_instant_rate },

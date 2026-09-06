@@ -24,6 +24,7 @@
  */
 
 #include "dirty_ram_interp.h"
+#include "overlay_dispatch_probe.h"
 #include "cpu_state.h"
 #include "debug_server.h"
 #include "interrupts.h"
@@ -2770,7 +2771,11 @@ static int dirty_ram_dispatch_inner(CPUState* cpu, uint32_t addr, uint32_t stop_
             g_exec_phase = prev_phase;
             ls_func_exit(addr, cpu, _gc);
             g_mixed_depth--;
-            if (_gc) return 1;
+            if (_gc) {
+                if (g_overlay_dispatch_probe_enabled)
+                    overlay_loader_dispatch_probe_note(cpu, addr, "static_native");
+                return 1;
+            }
         }
         clean_game_text_miss = psx_game_address_in_text(addr) ? 1 : 0;
     } else if (psx_game_address_in_text(addr)) {
@@ -2793,7 +2798,11 @@ static int dirty_ram_dispatch_inner(CPUState* cpu, uint32_t addr, uint32_t stop_
 #ifdef PSX_HAS_OVERLAY_DISPATCH
     {
         extern int psx_overlay_dispatch(CPUState *cpu, uint32_t addr);
-        if (psx_overlay_dispatch(cpu, addr)) return 1;
+        if (psx_overlay_dispatch(cpu, addr)) {
+            if (g_overlay_dispatch_probe_enabled)
+                overlay_loader_dispatch_probe_note(cpu, addr, "static_overlay");
+            return 1;
+        }
     }
 #endif
 
@@ -2994,6 +3003,8 @@ static int dirty_ram_dispatch_inner(CPUState* cpu, uint32_t addr, uint32_t stop_
         uint32_t before_s3 = cpu->gpr[19];
 #endif
         cosim_exec_one_begin();
+        if (g_overlay_dispatch_probe_enabled)
+            overlay_loader_dispatch_probe_note(cpu, pc, "interp_instruction");
         int transferred = exec_one_fetched(cpu, pc, insn, &next_pc);
 #ifndef PSX_NO_DEBUG_TOOLS
         /* Armed iff the window is NON-EMPTY, same as the callret ring: a `lo`

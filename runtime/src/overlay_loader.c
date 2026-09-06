@@ -1,4 +1,5 @@
 #include "overlay_loader.h"
+#include "overlay_dispatch_probe.h"
 #include "overlay_api.h"
 #include "overlay_path_canon.h"
 #include "code_provider.h"
@@ -77,6 +78,7 @@ typedef struct {
     uint32_t  val_gen;                   /* pagegen sum when last (in)validated*/
     int       state;                     /* ENTRY_VALID/INVALID/BLACKLIST      */
     int       dll;                       /* source DLL index                   */
+    const char *source_path;             /* diagnostic, stable loaded-path slot */
     uint8_t   tier;                      /* gcc=2, tcc=1, unknown=0            */
     int       next;                      /* next candidate at same addr, -1 end*/
     uint32_t  diff_passes;               /* clean same-state diffs (verify budget)*/
@@ -111,6 +113,55 @@ typedef struct {
 #endif
 static Candidate s_cand[CAND_CAP];
 static int       s_cand_n = 0;
+
+/* No printf, guest reads, revalidation, or selection changes. A fixed ring
+ * records actual decisions, including exact entries missed by the older CPS
+ * probe. The debug-server safe point owns arming/querying (not its TCP thread). */
+int g_overlay_dispatch_probe_enabled;
+static uint32_t s_dispatch_probe_lo, s_dispatch_probe_hi;
+static uint64_t s_dispatch_probe_total;
+static OverlayDispatchProbe s_dispatch_probe[OVERLAY_DISPATCH_PROBE_CAP];
+void overlay_loader_dispatch_probe_set(uint32_t lo, uint32_t hi) {
+    s_dispatch_probe_lo = lo & 0x1fffffffu;
+    s_dispatch_probe_hi = hi & 0x1fffffffu;
+    g_overlay_dispatch_probe_enabled = (lo || hi) &&
+        s_dispatch_probe_lo <= s_dispatch_probe_hi;
+    s_dispatch_probe_total = 0;
+}
+static void dispatch_probe(const CPUState *cpu, uint32_t addr,
+                           const char *event, int ci) {
+    if (!g_overlay_dispatch_probe_enabled) return;
+    uint32_t phys = addr & 0x1fffffffu;
+    if (phys < s_dispatch_probe_lo || phys > s_dispatch_probe_hi) return;
+    uint64_t seq = ++s_dispatch_probe_total;
+    OverlayDispatchProbe *p = &s_dispatch_probe[(seq - 1) % OVERLAY_DISPATCH_PROBE_CAP];
+    memset(p, 0, sizeof(*p));
+    p->seq=seq; p->addr=addr; p->pc=cpu->pc; p->a0=cpu->gpr[4];
+    p->s0=cpu->gpr[16]; p->ra=cpu->gpr[31]; p->event=event;
+    p->candidate=ci; p->dll=-1; p->state=-1;
+    if (ci >= 0 && ci < s_cand_n) {
+        const Candidate *c=&s_cand[ci];
+        p->owner=c->addr; p->crc=c->crc_code; p->dll=c->dll;
+        p->tier=c->tier; p->state=c->state;
+    }
+}
+void overlay_loader_dispatch_probe_note(const CPUState *cpu, uint32_t addr, const char *event) {
+    dispatch_probe(cpu, addr, event, -1);
+}
+int overlay_loader_dispatch_probe_get(OverlayDispatchProbe *out, int cap, uint64_t *total) {
+    if (total) *total=s_dispatch_probe_total;
+    if (!out || cap <= 0) return 0;
+    int n=s_dispatch_probe_total < OVERLAY_DISPATCH_PROBE_CAP
+        ? (int)s_dispatch_probe_total : OVERLAY_DISPATCH_PROBE_CAP;
+    if (n > cap) n=cap;
+    uint64_t first=s_dispatch_probe_total-(uint64_t)n;
+    for (int i=0;i<n;i++) out[i]=s_dispatch_probe[(first+(uint64_t)i)%OVERLAY_DISPATCH_PROBE_CAP];
+    return n;
+}
+const char *overlay_loader_dispatch_probe_path(int ci) {
+    return ci >= 0 && ci < s_cand_n && s_cand[ci].source_path
+        ? s_cand[ci].source_path : "";
+}
 
 /* CPS continuation lookup. A full candidate-table scan at every tail transfer
  * scales catastrophically once a warmed cache contains hundreds of variant
@@ -3010,6 +3061,13 @@ static int load_one_dll(const char *dll_path,
      * tracking table can never silently lose a loaded DLL again. */
     strncpy(s_loaded_paths[s_nloaded_paths], dll_path, 767);
     s_loaded_paths[s_nloaded_paths][767] = '\0';
+    /* loaded-path indices include deduplicated aliases; c->dll does not.
+     * Retain the actual canonical publication slot rather than indexing the
+     * path table by dll later and misattributing a post-alias native run. */
+    if (registered > 0)
+        for (int ci=0; ci<s_cand_n; ci++)
+            if (s_cand[ci].dll == s_ndlls)
+                s_cand[ci].source_path = s_loaded_paths[s_nloaded_paths];
     s_nloaded_paths++;
     if (registered > 0) s_ndlls++;
     return registered;
@@ -3496,6 +3554,7 @@ static int overlay_find_by_range(uint32_t phys) {
 }
 
 int overlay_loader_dispatch(CPUState *cpu, uint32_t addr) {
+    dispatch_probe(cpu, addr, "request", -1);
     uint32_t phys = addr & 0x1FFFFFFFu;
     /* Overlay dispatch is a no-op when the overlay loader is inactive
      * (overlay_cache=false): there are no candidates to match, so this must
@@ -3509,8 +3568,9 @@ int overlay_loader_dispatch(CPUState *cpu, uint32_t addr) {
      * loop never terminates (infinite spin in range_candidate_matches). Every
      * overlay-off + CPS game hit this and wedged at boot before any game code ran
      * (found via Ape Escape, the only overlay-off title). Fail closed here. */
-    if (!s_active) return 0;
+    if (!s_active) { dispatch_probe(cpu, addr, "inactive", -1); return 0; }
     if (overlay_cache_window_contains(phys) && lazy_miss_cached(phys)) {
+        dispatch_probe(cpu, addr, "negative_cache", -1);
         s_disp_interp++;
         return 0;
     }
@@ -3553,6 +3613,7 @@ retry_candidates:
     if (head < 0 && g_psx_cps_mode) {
         int ci = loaded_range_ci >= 0 ? loaded_range_ci
                                       : overlay_find_by_range(phys);
+        dispatch_probe(cpu, addr, "range", ci);
         int _probe = (s_cps_probe_pc && phys == s_cps_probe_pc);
         if (_probe) {
             s_cps_probe_count++;
@@ -3583,7 +3644,7 @@ retry_candidates:
             if (_probe) s_cps_probe_matched = matched;
             if (matched) {
                 if (c->state != ENTRY_VALID) { c->state = ENTRY_VALID; s_valid_count++; }
-                if (c->device_touch)   { if (_probe) s_cps_probe_outcome = 3; s_disp_interp++; return 0; }
+                if (c->device_touch)   { dispatch_probe(cpu, addr, "device", ci); if (_probe) s_cps_probe_outcome = 3; s_disp_interp++; return 0; }
                 /* Diff instrument — same contract as the entry chain's want_diff
                  * gate below. A continuation re-entry must NOT run native blind
                  * while its candidate is still inside the verify budget: CPS
@@ -3604,15 +3665,16 @@ retry_candidates:
                     if (want_diff && addr < 0x10000u) want_diff = 0;
                     if (want_diff && (s_diff_addr || c->diff_passes < OVERLAY_DIFF_BUDGET)) {
                         if (_probe) s_cps_probe_outcome = 5;
+                        dispatch_probe(cpu, addr, "diff_gate", ci);
                         s_diffgate_interp++;
                         s_disp_interp++;
                         return 0;
                     }
                     if (!s_native_exec || overlay_native_blocked(c->addr) || overlay_native_blocked(addr))
-                                           { if (_probe) s_cps_probe_outcome = 4; s_would_run_native++; s_disp_interp++; return 0; }
+                                           { dispatch_probe(cpu, addr, "blocked", ci); if (_probe) s_cps_probe_outcome = 4; s_would_run_native++; s_disp_interp++; return 0; }
 #ifndef PSX_NO_DEBUG_TOOLS
                     if (!native_rank_allows(c, addr))
-                                           { if (_probe) s_cps_probe_outcome = 7; s_would_run_native++; s_disp_interp++; return 0; }
+                                           { dispatch_probe(cpu, addr, "rank_gate", ci); if (_probe) s_cps_probe_outcome = 7; s_would_run_native++; s_disp_interp++; return 0; }
 #endif
                 }
                 if (_probe) s_cps_probe_outcome = 2;
@@ -3638,7 +3700,9 @@ retry_candidates:
                     int prev_phase = g_exec_phase;
                     OverlayFlushFn prev_flush = overlay_flush_enter(c);
                     g_exec_phase = 2;
+                    dispatch_probe(cpu, addr, "native", ci);
                     c->fn(cpu);
+                    dispatch_probe(cpu, addr, "returned", ci);
                     overlay_flush_leave(prev_flush);
                     g_exec_phase = prev_phase;
                 }
@@ -3647,6 +3711,7 @@ retry_candidates:
                 s_nring[slot].returned = 1;
                 s_native_inprogress = prev_inprogress;
                 if (g_native_bad_entry) {  /* foreign interior entry: fail closed to interp */
+                    dispatch_probe(cpu, addr, "bad_entry", ci);
                     g_native_bad_entry = 0;
                     s_disp_native--; s_disp_interp++;
                     return 0;            /* cpu->pc was restored to the requested PC */
@@ -3654,13 +3719,15 @@ retry_candidates:
                 return 1;
             }
             if (_probe) s_cps_probe_outcome = 1;
+            dispatch_probe(cpu, addr, "crc_miss", ci);
             /* stale code bytes: fall through to the interpreter */
         }
     }
 
     for (int i = head; i >= 0; i = s_cand[i].next) {
         Candidate *c = &s_cand[i];
-        if (c->state == ENTRY_BLACKLIST) continue;
+        dispatch_probe(cpu, addr, "exact", i);
+        if (c->state == ENTRY_BLACKLIST) { dispatch_probe(cpu, addr, "blacklist", i); continue; }
 
         /* Generation-gated validation (overlay-cache v2 P2). The ONLY way this
          * entry's compiled code bytes can change is a write to one of its watched
@@ -3681,6 +3748,7 @@ retry_candidates:
             matched = 1;                 /* no watched write since validation */
             s_gen_fastpath++;
         } else if (c->state == ENTRY_INVALID && gen == c->val_gen) {
+            dispatch_probe(cpu, addr, "cached_crc_miss", i);
             /* This exact byte identity already failed after the most recent
              * watched write. Re-hashing it on every dispatch makes reused
              * variant chains scale with cache history instead of live code. */
@@ -3701,7 +3769,7 @@ retry_candidates:
             /* Device-touching functions never run their shard: the shadow diff
              * can't safely double-execute MMIO/SIO/DMA to validate them, so they
              * always fall to the interpreter (the authoritative single path). */
-            if (c->device_touch) { s_disp_interp++; return 0; }
+            if (c->device_touch) { dispatch_probe(cpu, addr, "device", i); s_disp_interp++; return 0; }
             /* Same-state differential: run native+interp from identical state,
              * compare, keep the interp result. Takes precedence over the A/B
              * toggle. Verify-budget: once a candidate has passed cleanly enough
@@ -3737,10 +3805,12 @@ retry_candidates:
                  * it gets diffed at its next non-exception dispatch. */
                 extern int psx_get_in_exception(void);
                 if (psx_get_in_exception()) {
+                    dispatch_probe(cpu, addr, "exception_diff_gate", i);
                     s_diffgate_interp++;
                     s_disp_interp++;
                     return 0;
                 }
+                dispatch_probe(cpu, addr, "shadow_diff", i);
                 run_shadow_diff(cpu, c, addr);
                 return 1;
             }
@@ -3750,10 +3820,10 @@ retry_candidates:
              * handles it. The per-function blocklist forces the same interp
              * routing for one function only (bisection localization). */
             if (!s_native_exec || overlay_native_blocked(c->addr))
-                { s_would_run_native++; s_disp_interp++; return 0; }
+                { dispatch_probe(cpu, addr, "blocked", i); s_would_run_native++; s_disp_interp++; return 0; }
 #ifndef PSX_NO_DEBUG_TOOLS
             if (!native_rank_allows(c, addr))
-                { s_would_run_native++; s_disp_interp++; return 0; }
+                { dispatch_probe(cpu, addr, "rank_gate", i); s_would_run_native++; s_disp_interp++; return 0; }
 #endif
 
             /* Record into the always-on ring BEFORE the call; mark in-progress
@@ -3784,7 +3854,9 @@ retry_candidates:
                 int prev_phase = g_exec_phase;
                 OverlayFlushFn prev_flush = overlay_flush_enter(c);
                 g_exec_phase = 2;
+                dispatch_probe(cpu, addr, "native", i);
                 c->fn(cpu);
+                dispatch_probe(cpu, addr, "returned", i);
                 overlay_flush_leave(prev_flush);
                 g_exec_phase = prev_phase;
             }
@@ -3797,12 +3869,14 @@ retry_candidates:
             s_nring[slot].returned = 1;
             s_native_inprogress = prev_inprogress;   /* restore (nested calls) */
             if (g_native_bad_entry) {  /* foreign interior entry: fail closed to interp */
+                dispatch_probe(cpu, addr, "bad_entry", i);
                 g_native_bad_entry = 0;
                 s_disp_native--; s_disp_interp++;
                 return 0;            /* cpu->pc was restored to the requested PC */
             }
             return 1;
         } else {
+            dispatch_probe(cpu, addr, "crc_miss", i);
             s_rehash_miss++;
             if (c->state == ENTRY_VALID) {
                 c->state = ENTRY_INVALID;
@@ -3825,6 +3899,7 @@ retry_candidates:
     }
 
     if (overlay_cache_window_contains(phys)) lazy_miss_record(phys);
+    dispatch_probe(cpu, addr, "fallback", -1);
     s_disp_interp++;
     return 0;
 }
