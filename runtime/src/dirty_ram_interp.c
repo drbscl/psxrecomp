@@ -24,6 +24,7 @@
  */
 
 #include "dirty_ram_interp.h"
+#include "title_ui.h"
 #include "overlay_dispatch_probe.h"
 #include "cpu_state.h"
 #include "debug_server.h"
@@ -2230,6 +2231,8 @@ static int exec_one_fetched_inner(CPUState *cpu, uint32_t pc, uint32_t insn,
             cpu->gpr[rt] = psx_ws_xclip_bound(psx_cyc_load_word(cpu, addr, rt, 1u << rs));
         else
             cpu->gpr[rt] = psx_cyc_load_word(cpu, addr, rt, 1u << rs);
+        if (title_ui_filter_load_word)
+            cpu->gpr[rt] = title_ui_filter_load_word(pc, addr, cpu->gpr[rt], cpu->gpr);
         psx_pgxp_load(cpu, insn, addr, cpu->gpr[rt]);
         cpu->gpr[0] = 0;
         return 0;

@@ -4,6 +4,11 @@
  * remains available for headless / launcher-less builds. */
 
 #include "host_osd.h"
+#include "title_ui.h"
+#include <stddef.h>
+
+uint32_t (*title_ui_filter_load_word)(uint32_t, uint32_t, uint32_t, const uint32_t *) = NULL;
+void (*title_ui_reset)(void) = NULL;
 #include "psx_rewind.h"
 #include "psx_savestate_menu.h"
 #include "psx_sdl.h"

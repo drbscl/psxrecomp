@@ -24,6 +24,7 @@
 #include "psx_rewind.h"
 #include "psx_savestate_menu.h"
 #include "host_osd.h"
+#include "title_ui.h"
 #include "host_keymap.h"
 #include "overlay_capture.h"
 #include "overlay_loader.h"
@@ -5089,6 +5090,15 @@ static void netplay_barrier_admit(int override) {
         if (!g_headless) {
             SDL_Event ev;
             while (SDL_PollEvent(&ev)) {
+                /* Optional title focus must never survive host focus/device loss. */
+#if defined(PSX_SDL3)
+                const bool title_focus_lost = ev.type == SDL_EVENT_WINDOW_FOCUS_LOST;
+#else
+                const bool title_focus_lost = ev.type == SDL_WINDOWEVENT &&
+                    ev.window.event == SDL_WINDOWEVENT_FOCUS_LOST;
+#endif
+                if (title_ui_reset && (title_focus_lost ||
+                    ev.type == SDL_CONTROLLERDEVICEREMOVED)) title_ui_reset();
                 if (ev.type == SDL_QUIT) {
                     netplay_soft_exit("sdl_window_close");
                     if (psx_return_to_lobby_requested()) return;
@@ -5836,6 +5846,15 @@ static void rewind_host_pause_loop(void) {
     while (psx_rewind_is_open()) {
         SDL_Event ev;
         while (SDL_PollEvent(&ev)) {
+                /* Optional title focus must never survive host focus/device loss. */
+#if defined(PSX_SDL3)
+                const bool title_focus_lost = ev.type == SDL_EVENT_WINDOW_FOCUS_LOST;
+#else
+                const bool title_focus_lost = ev.type == SDL_WINDOWEVENT &&
+                    ev.window.event == SDL_WINDOWEVENT_FOCUS_LOST;
+#endif
+                if (title_ui_reset && (title_focus_lost ||
+                    ev.type == SDL_CONTROLLERDEVICEREMOVED)) title_ui_reset();
             if (ev.type == SDL_QUIT) {
                 psx_crash_trace_set_exit_origin("sdl_window_close");
                 shutdown_runtime();
@@ -5877,6 +5896,15 @@ static void savestate_menu_host_pause_loop(void) {
     while (savestate_menu_open) {
         SDL_Event ev;
         while (SDL_PollEvent(&ev)) {
+                /* Optional title focus must never survive host focus/device loss. */
+#if defined(PSX_SDL3)
+                const bool title_focus_lost = ev.type == SDL_EVENT_WINDOW_FOCUS_LOST;
+#else
+                const bool title_focus_lost = ev.type == SDL_WINDOWEVENT &&
+                    ev.window.event == SDL_WINDOWEVENT_FOCUS_LOST;
+#endif
+                if (title_ui_reset && (title_focus_lost ||
+                    ev.type == SDL_CONTROLLERDEVICEREMOVED)) title_ui_reset();
             if (ev.type == SDL_QUIT) {
                 psx_crash_trace_set_exit_origin("sdl_window_close");
                 shutdown_runtime();
@@ -6080,6 +6108,15 @@ static NetplayVblankEpilogue sdl_vblank_present_body(void) {
         /* Pump SDL events to prevent window freeze. */
         SDL_Event ev;
         while (SDL_PollEvent(&ev)) {
+                /* Optional title focus must never survive host focus/device loss. */
+#if defined(PSX_SDL3)
+                const bool title_focus_lost = ev.type == SDL_EVENT_WINDOW_FOCUS_LOST;
+#else
+                const bool title_focus_lost = ev.type == SDL_WINDOWEVENT &&
+                    ev.window.event == SDL_WINDOWEVENT_FOCUS_LOST;
+#endif
+                if (title_ui_reset && (title_focus_lost ||
+                    ev.type == SDL_CONTROLLERDEVICEREMOVED)) title_ui_reset();
             if (ev.type == SDL_QUIT) {
                 if (psx_netplay_active()) {
                     netplay_soft_exit("sdl_window_close");
