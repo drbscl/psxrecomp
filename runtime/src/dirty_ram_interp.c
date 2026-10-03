@@ -33,6 +33,9 @@
 #include "psx_icache.h"
 #include "psx_instr_cost.h"  /* psx_instr_base_cycles — single-source cycle cost */
 #include "gpu.h"   /* psx_ws_is_backdrop_site / psx_ws_backdrop_x (interp hook) */
+#ifdef PSX_TITLE_ACPP_DYNAMIC_ASPECT
+#include "acpp_dynamic_cull.h"
+#endif
 #include "ws_backdrop_detect.h"  /* shared backdrop-window detector (auto_backdrop) */
 #include "lockstep.h"
 #include "starvation_ring.h"
@@ -1423,6 +1426,9 @@ static int exec_one_fetched_inner(CPUState *cpu, uint32_t pc, uint32_t insn,
 
 static int exec_one_fetched(CPUState *cpu, uint32_t pc, uint32_t insn,
                             uint32_t *next_pc_out) {
+#if defined(PSX_TITLE_ACPP_DYNAMIC_ASPECT)
+    psx_title_scene_block(cpu,pc);
+#endif
     /* A load's writeback becomes visible to the instruction AFTER its delay
      * slot: load at N, hidden from N+1, visible from N+2. s_ld_pend_age tracks
      * that: 0 = armed by the instruction just executed, 1 = the delay slot has
@@ -1953,7 +1959,12 @@ static int exec_one_fetched_inner(CPUState *cpu, uint32_t pc, uint32_t insn,
             else
                 taken = ((int32_t)cpu->gpr[rs] <  0);
             break;
-        case 0x01: /* BGEZ */    taken = ((int32_t)cpu->gpr[rs] >= 0); break;
+        case 0x01: /* BGEZ */
+            taken = ((int32_t)cpu->gpr[rs] >= 0);
+#ifdef PSX_TITLE_ACPP_DYNAMIC_ASPECT
+            taken = acpp_dynamic_cull_result(cpu,pc,insn,cpu->gpr[rs],taken);
+#endif
+            break;
         case 0x10: /* BLTZAL */  taken = ((int32_t)cpu->gpr[rs] <  0);
                                   cpu->gpr[31] = pc + 8; break;
         case 0x11: /* BGEZAL */  taken = ((int32_t)cpu->gpr[rs] >= 0);
@@ -1995,6 +2006,9 @@ static int exec_one_fetched_inner(CPUState *cpu, uint32_t pc, uint32_t insn,
     }
     case 0x0A: /* SLTI */
     {
+#ifdef PSX_TITLE_ACPP_DYNAMIC_ASPECT
+        uint32_t acpp_source=cpu->gpr[rs];
+#endif
         uint32_t vanilla = ((int32_t)cpu->gpr[rs] < simm) ? 1u : 0u;
         uint32_t kept = vanilla;
         if (psx_ws_aspect_cone_site(cpu, pc, insn, vanilla, &kept))
@@ -2014,11 +2028,17 @@ static int exec_one_fetched_inner(CPUState *cpu, uint32_t pc, uint32_t insn,
             cpu->gpr[rt] = (uint32_t)psx_ws_cull_slti(cpu->gpr[rs], imm);
         else
             cpu->gpr[rt] = ((int32_t)cpu->gpr[rs] < simm) ? 1u : 0u;
+#ifdef PSX_TITLE_ACPP_DYNAMIC_ASPECT
+        cpu->gpr[rt]=acpp_dynamic_cull_result(cpu,pc,insn,acpp_source,cpu->gpr[rt]);
+#endif
         cpu->gpr[0] = 0;
         return 0;
     }
     case 0x0B: /* SLTIU */
     {
+#ifdef PSX_TITLE_ACPP_DYNAMIC_ASPECT
+        uint32_t acpp_source=cpu->gpr[rs];
+#endif
         uint32_t vanilla = (cpu->gpr[rs] < (uint32_t)simm) ? 1u : 0u;
         uint32_t kept = vanilla;
         /* Widescreen render-funnel cull widening (auto_screen_x): apply the
@@ -2043,6 +2063,9 @@ static int exec_one_fetched_inner(CPUState *cpu, uint32_t pc, uint32_t insn,
             cpu->gpr[rt] = (uint32_t)psx_ws_cull_sltiu(cpu->gpr[rs], imm);
         else
             cpu->gpr[rt] = (cpu->gpr[rs] < (uint32_t)simm) ? 1u : 0u;
+#ifdef PSX_TITLE_ACPP_DYNAMIC_ASPECT
+        cpu->gpr[rt]=acpp_dynamic_cull_result(cpu,pc,insn,acpp_source,cpu->gpr[rt]);
+#endif
         cpu->gpr[0] = 0;
         return 0;
     }
@@ -2697,7 +2720,7 @@ void psx_precise_slice_init_from_env(void) {
  * interpreter and left cpu->pc at a dispatchable resume point; the caller MUST
  * `return` so its compiled body does not re-execute the same instructions).
  * Returns 0 if the whole block is provably safe to run as fast compiled C. */
-int psx_slice_block_impl(CPUState *cpu, uint32_t block_addr, uint32_t bcyc, int side_effects) {
+static int psx_slice_block_run(CPUState *cpu, uint32_t block_addr, uint32_t bcyc, int side_effects) {
     /* PARKED (PRECISE_IRQ_SLICE.md): precise take-point slicing is a later
      * correctness upgrade, NOT the current FMV blocker (that is the -8 cycle
      * drift / faithful per-instruction cycle model — see CLAUDE.md Rule -1). */
@@ -2732,6 +2755,14 @@ int psx_slice_block_impl(CPUState *cpu, uint32_t block_addr, uint32_t bcyc, int 
     cpu->pc = block_addr;
     psx_run_precise(cpu, bcyc, has_deadline);
     return 1;
+}
+int psx_slice_block_impl(CPUState *cpu, uint32_t block_addr, uint32_t bcyc, int side_effects) {
+    int sliced=psx_slice_block_run(cpu,block_addr,bcyc,side_effects);
+#if defined(PSX_TITLE_ACPP_DYNAMIC_ASPECT)
+    /* Sliced blocks stamp only instructions actually retired by the interpreter. */
+    if (!sliced) psx_title_scene_block(cpu,block_addr);
+#endif
+    return sliced;
 }
 
 static int dirty_ram_dispatch_inner(CPUState* cpu, uint32_t addr, uint32_t stop_addr) {

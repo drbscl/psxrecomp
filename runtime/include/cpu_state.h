@@ -168,11 +168,24 @@ extern void psx_dispatch_call(CPUState* cpu, uint32_t target_addr, uint32_t retu
 extern int g_psx_precise_slice;
 extern int psx_slice_block_impl(CPUState* cpu, uint32_t block_addr, uint32_t bcyc, int side_effects);
 void psx_precise_slice_init_from_env(void);
+#if defined(PSX_TITLE_ACPP_DYNAMIC_ASPECT)
+void acpp_dynamic_scene_block(CPUState* cpu, uint32_t pc);
+static inline void psx_title_scene_block(CPUState* cpu, uint32_t pc) {
+    /* Cheap rejection on hot block/instruction paths; host owns the phase. */
+    if (pc-0x8004a68cu<0x404u)
+        acpp_dynamic_scene_block(cpu,pc);
+}
+#endif
 #ifdef PSX_OVERLAY_DLL_BUILD
 int psx_slice_block(CPUState* cpu, uint32_t block_addr, uint32_t bcyc, int side_effects);
 #else
 static inline int psx_slice_block(CPUState* cpu, uint32_t block_addr, uint32_t bcyc, int side_effects) {
-    if (!g_psx_precise_slice) return 0;
+    if (!g_psx_precise_slice) {
+#if defined(PSX_TITLE_ACPP_DYNAMIC_ASPECT)
+        psx_title_scene_block(cpu,block_addr);
+#endif
+        return 0;
+    }
     return psx_slice_block_impl(cpu, block_addr, bcyc, side_effects);
 }
 #endif

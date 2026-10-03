@@ -1254,6 +1254,7 @@ static int           g_video_aspect_den = 3;
  * initial window; after the game window exists these values follow its live
  * aspect, clamped to 4:3..the widest mode offered by the title. */
 static bool          g_ws_adaptive_view = false;
+static bool          g_ws_dynamic_crop = false;
 static int           g_ws_adaptive_max_num = 16;
 static int           g_ws_adaptive_max_den = 9;
 /* game.toml [netplay] local_viewport = "vertical_split": during real netplay,
@@ -1278,6 +1279,8 @@ extern "C" int psx_mod_set_fixed_display_aspect(
     g_video_aspect_num = (int)numerator;
     g_video_aspect_den = (int)denominator;
     g_ws_adaptive_view = false;
+    g_ws_dynamic_crop = false;
+    gpu_ws_set_preserve_authored(0);
     std::fprintf(stdout, "psxrecomp: mod selected fixed display aspect %u:%u\n",
                  (unsigned)numerator, (unsigned)denominator);
     return 1;
@@ -1295,6 +1298,8 @@ extern "C" int psx_mod_set_adaptive_display_aspect(
         return 0;
     }
     g_ws_adaptive_view = true;
+    g_ws_dynamic_crop = false;
+    gpu_ws_set_preserve_authored(0);
     g_ws_adaptive_max_num = (int)max_numerator;
     g_ws_adaptive_max_den = (int)max_denominator;
     std::fprintf(stdout,
@@ -1302,6 +1307,15 @@ extern "C" int psx_mod_set_adaptive_display_aspect(
         "(initial %d:%d, range 4:3 through %u:%u)\n",
         g_video_aspect_num, g_video_aspect_den,
         (unsigned)max_numerator, (unsigned)max_denominator);
+    return 1;
+}
+
+extern "C" int psx_mod_set_dynamic_display_aspect(
+    uint32_t max_numerator, uint32_t max_denominator) {
+    if (!psx_mod_set_adaptive_display_aspect(max_numerator, max_denominator))
+        return 0;
+    g_ws_dynamic_crop = true;
+    gpu_ws_set_preserve_authored(1);
     return 1;
 }
 
@@ -1496,6 +1510,16 @@ static int           g_ws_native_wide = 1;
  * creation alongside SDL_RenderSetLogicalSize. */
 static int           g_logical_w = 640;
 
+/* The sidecar never exceeds canonical VRAM width. Bound the scale before
+ * any dimension/product arithmetic; allocate once, never on resize. */
+static uint32_t* allocate_present_staging(int scale) {
+    if (scale < 1 || scale > 16) return nullptr;
+    const size_t width = (size_t)(g_ws_dynamic_crop ? 1024 : 640) * (size_t)scale;
+    const size_t height = (size_t)512 * (size_t)scale;
+    if (width > SIZE_MAX / height / sizeof(uint32_t)) return nullptr;
+    return (uint32_t*)std::malloc(width * height * sizeof(uint32_t));
+}
+
 /* Clamp a requested window width to the primary display's usable area so an
  * oversized choice (e.g. 1920 on a 1080p panel) still fits on screen. Keeps
  * the given aspect: height = width*den/num. */
@@ -1576,7 +1600,8 @@ static int g_ws_projection_mode = -1;
 static void refresh_widescreen_projection() {
     if (!g_ws_engaged) return;
 
-    const bool wide = g_video_aspect_num * 3 != g_video_aspect_den * 4;
+    const bool wide = (int64_t)g_video_aspect_num * 3 >
+                      (int64_t)g_video_aspect_den * 4;
     const bool local_native_wide =
         g_netplay_local_viewport == 1 && psx_netplay_active() &&
         gpu_last_frame_vertical_split_screen();
@@ -1586,6 +1611,7 @@ static void refresh_widescreen_projection() {
     const int mode = wide ? (native_wide ? 2 : 1) : 0;
     int proj_num = g_video_aspect_num;
     int proj_den = g_video_aspect_den;
+    if (!wide) { proj_num = 4; proj_den = 3; }
     if (mode == 1) {
         netplay_local_viewport_projection_aspect(
             g_video_aspect_num, g_video_aspect_den, &proj_num, &proj_den);
@@ -1613,11 +1639,30 @@ static void update_adaptive_widescreen() {
     if (!g_ws_adaptive_view || !sdl_window) return;
 
     int width = 0, height = 0;
-    SDL_GetWindowSize(sdl_window, &width, &height);
+    if (SDL_GetWindowFlags(sdl_window) & SDL_WINDOW_MINIMIZED) return;
+    if (SDL_GetWindowFlags(sdl_window) & SDL_WINDOW_OPENGL)
+        SDL_GL_GetDrawableSize(sdl_window, &width, &height);
+    else if (sdl_renderer)
+        SDL_GetRendererOutputSize(sdl_renderer, &width, &height);
+    else
+        SDL_GetWindowSize(sdl_window, &width, &height);
     if (width <= 0 || height <= 0) return;
+    /* Presentation rings and backend viewport dimensions are signed 16-bit;
+     * reject an unsupported drawable instead of overflowing ratio arithmetic. */
+    if (width > 32767 || height > 32767) {
+        std::fprintf(stderr, "psxrecomp: unsupported drawable %dx%d\n", width, height);
+        std::abort();
+    }
+    static int last_width = 0, last_height = 0;
+    if (width != last_width || height != last_height) {
+        last_width = width;
+        last_height = height;
+        gl_renderer_invalidate_present();
+        s_disabled_frame_presented = false;
+    }
 
     int num = width, den = height;
-    if ((int64_t)width * 3 <= (int64_t)height * 4) {
+    if (!g_ws_dynamic_crop && (int64_t)width * 3 <= (int64_t)height * 4) {
         num = 4; den = 3;
     } else if ((int64_t)width * g_ws_adaptive_max_den >=
                (int64_t)height * g_ws_adaptive_max_num) {
@@ -1634,8 +1679,11 @@ static void update_adaptive_widescreen() {
     g_video_aspect_den = den;
     gl_renderer_set_display_aspect(num, den);
     if (sdl_renderer) {
-        g_logical_w = 480 * num * g_video_scale / den;
-        SDL_RenderSetLogicalSize(sdl_renderer, g_logical_w, 480 * g_video_scale);
+        g_logical_w = (int)((int64_t)480 * num * g_video_scale / den);
+        if (g_logical_w < 1) g_logical_w = 1;
+        SDL_RenderSetLogicalSize(sdl_renderer,
+            g_ws_dynamic_crop ? 0 : g_logical_w,
+            g_ws_dynamic_crop ? 0 : 480 * g_video_scale);
     }
 
     refresh_widescreen_projection();
@@ -1720,9 +1768,11 @@ static int ensure_sw_sdl_present(void) {
         /* Netplay CPU-auth: size logical/texture at 1× (sim has no hi-res
          * mirror). Offline SSAA preference stays in g_video_scale. */
         const int tex_scale = netplay_cpu_auth_gpu() ? 1 : g_video_scale;
-        g_logical_w = 480 * g_video_aspect_num * tex_scale / g_video_aspect_den;
+        g_logical_w = (int)((int64_t)480 * g_video_aspect_num * tex_scale / g_video_aspect_den);
         if (g_logical_w < 1) g_logical_w = 640;
-        SDL_RenderSetLogicalSize(sdl_renderer, g_logical_w, 480 * tex_scale);
+        SDL_RenderSetLogicalSize(sdl_renderer,
+            g_ws_dynamic_crop ? 0 : g_logical_w,
+            g_ws_dynamic_crop ? 0 : 480 * tex_scale);
     }
     if (!sdl_texture) {
         const int tex_scale = netplay_cpu_auth_gpu() ? 1 : g_video_scale;
@@ -1730,7 +1780,7 @@ static int ensure_sw_sdl_present(void) {
             sdl_renderer,
             SDL_PIXELFORMAT_ARGB8888,
             SDL_TEXTUREACCESS_STREAMING,
-            640 * tex_scale, 512 * tex_scale);
+            (g_ws_dynamic_crop ? 1024 : 640) * tex_scale, 512 * tex_scale);
         if (!sdl_texture) {
             std::fprintf(stderr,
                          "psxrecomp: netplay SW present: SDL_CreateTexture failed: %s\n",
@@ -1742,8 +1792,7 @@ static int ensure_sw_sdl_present(void) {
     }
     if (!sdl_pixel_buf) {
         const int tex_scale = netplay_cpu_auth_gpu() ? 1 : g_video_scale;
-        sdl_pixel_buf = (uint32_t*)std::malloc(
-            (size_t)640 * tex_scale * 512 * tex_scale * sizeof(uint32_t));
+        sdl_pixel_buf = allocate_present_staging(tex_scale);
         if (!sdl_pixel_buf) {
             std::fprintf(stderr, "psxrecomp: netplay SW present: staging alloc failed\n");
             return -1;
@@ -6708,7 +6757,9 @@ static NetplayVblankEpilogue sdl_vblank_present_body(void) {
          * wide (compositor unsupported, or the surface fallback below)
          * pillarboxes 4:3 like FMV/menus instead. Only squash mode (1) may
          * stretch: its canonical content is pre-squashed FOR the stretch. */
-        const bool nw_pin = g_ws_engaged && g_ws_native_wide;
+        const bool nw_pin = g_ws_engaged && g_ws_native_wide &&
+            (!g_ws_dynamic_crop ||
+             (int64_t)g_video_aspect_num * 3 > (int64_t)g_video_aspect_den * 4);
 
         /* Ring the classification now that it's final (only the software/CPU
          * wide path below can still fall back — it amends this entry). A
@@ -6956,7 +7007,7 @@ static NetplayVblankEpilogue sdl_vblank_present_body(void) {
     const int tex_scale = netplay_cpu_auth_gpu() ? 1 : g_video_scale;
     const int tex_h = 512 * tex_scale;
     if (src_w > 0 && src_h > 0 && src_h < tex_h) {
-        static uint32_t s_black_pad[640 * 4]; /* covers g_video_scale <= 4 */
+        static uint32_t s_black_pad[1024 * 16]; /* covers bounded internal scale */
         const int pad_cap = (int)(sizeof(s_black_pad) / sizeof(s_black_pad[0]));
         const int pad_w = (src_w <= pad_cap) ? src_w : pad_cap;
         for (int i = 0; i < pad_w; i++)
@@ -6973,11 +7024,35 @@ static NetplayVblankEpilogue sdl_vblank_present_body(void) {
     int dst_w = pin_43 ? 640 * tex_scale : g_logical_w;
     int dst_h = 480 * tex_scale;
     SDL_Rect dst = { (g_logical_w - dst_w) / 2, 0, dst_w, dst_h };
+    if (g_ws_dynamic_crop) {
+        int out_w = 0, out_h = 0;
+        SDL_RenderSetLogicalSize(sdl_renderer, 0, 0);
+        SDL_GetRendererOutputSize(sdl_renderer, &out_w, &out_h);
+        if (out_w <= 0 || out_h <= 0 ||
+            (SDL_GetWindowFlags(sdl_window) & SDL_WINDOW_MINIMIZED))
+            return ep;
+        const int num = pin_43 ? 4 : g_video_aspect_num;
+        const int den = pin_43 ? 3 : g_video_aspect_den;
+        if (!pin_43 && (int64_t)num * 3 < (int64_t)den * 4) {
+            dst.w = (int)((int64_t)out_h * 4 / 3);
+            dst.h = out_h;
+        } else {
+            dst.w = out_w;
+            dst.h = (int)((int64_t)out_w * den / num);
+            if (dst.h > out_h) {
+                dst.h = out_h;
+                dst.w = (int)((int64_t)out_h * num / den);
+            }
+        }
+        dst.x = (out_w - dst.w) / 2;
+        dst.y = (out_h - dst.h) / 2;
+        dst_h = dst.h;
+    }
     /* Match GL: short display bands letterbox inside the 4:3 rect. */
-    if (pin_43 && h > 0 && h < 240) {
+    if (pin_43 && h > 0 && (g_ws_dynamic_crop ? h < 192 : h < 240)) {
         int content_h = (dst_h * (int)h) / 240;
         if (content_h < 1) content_h = 1;
-        dst.y = (dst_h - content_h) / 2;
+        dst.y += (dst_h - content_h) / 2;
         dst.h = content_h;
     }
     /* Match GL depth24 nearest present — linear AA fringes short FMV bands
@@ -12489,6 +12564,12 @@ session_reboot:
         g_video_renderer = 1;
     }
 #endif
+    if (g_ws_dynamic_crop && g_video_renderer == 2) {
+        std::fprintf(stderr,
+            "psxrecomp: dynamic vertical-FOV viewport requires OpenGL or software; "
+            "select faithful 4:3 to use Vulkan.\n");
+        return 1;
+    }
     /* Netplay: CPU VRAM is digest/snap authority. Prefer dual-raster OpenGL
      * (SW@1× + GL@settings SSAA FBO present, never glReadPixels). Vulkan
      * present not yet cpu-auth — fall back to a software window. */
@@ -12595,7 +12676,8 @@ session_reboot:
      * this aspect; native-wide fills it with a genuinely wider frame (no
      * stretch), squash mode stretches the 4:3 frame into it. */
     gl_renderer_set_display_aspect(g_video_aspect_num, g_video_aspect_den);
-    if (g_video_aspect_num * 3 != g_video_aspect_den * 4) {
+    if (g_ws_adaptive_view || (int64_t)g_video_aspect_num * 3 !=
+                              (int64_t)g_video_aspect_den * 4) {
         /* Hold widescreen off through the BIOS boot (authentic 4:3 logos);
          * the per-frame present path engages it at game entry. */
         g_ws_engaged = false;
@@ -13065,8 +13147,10 @@ session_reboot:
      * unchanged. Netplay CPU-auth: always 1× (sim has no hi-res mirror). */
     {
         const int tex_scale = netplay_cpu_auth_gpu() ? 1 : g_video_scale;
-        g_logical_w = 480 * g_video_aspect_num * tex_scale / g_video_aspect_den;
-        SDL_RenderSetLogicalSize(sdl_renderer, g_logical_w, 480 * tex_scale);
+        g_logical_w = (int)((int64_t)480 * g_video_aspect_num * tex_scale / g_video_aspect_den);
+        SDL_RenderSetLogicalSize(sdl_renderer,
+            g_ws_dynamic_crop ? 0 : g_logical_w,
+            g_ws_dynamic_crop ? 0 : 480 * tex_scale);
     }
   }
 
@@ -13074,8 +13158,7 @@ session_reboot:
      * (640x512 native, times the supersampling factor). Netplay: 1×. */
     {
         const int tex_scale = netplay_cpu_auth_gpu() ? 1 : g_video_scale;
-        sdl_pixel_buf = (uint32_t*)std::malloc(
-            (size_t)640 * tex_scale * 512 * tex_scale * sizeof(uint32_t));
+        sdl_pixel_buf = allocate_present_staging(tex_scale);
         if (!sdl_pixel_buf) {
             std::fprintf(stderr, "failed to allocate %dx staging buffer\n", tex_scale);
             return 1;
@@ -13088,7 +13171,7 @@ session_reboot:
         sdl_renderer,
         SDL_PIXELFORMAT_ARGB8888,
         SDL_TEXTUREACCESS_STREAMING,
-        640 * tex_scale, 512 * tex_scale
+        (g_ws_dynamic_crop ? 1024 : 640) * tex_scale, 512 * tex_scale
     );
     if (!sdl_texture) {
         std::fprintf(stderr, "SDL_CreateTexture failed: %s\n", SDL_GetError());
@@ -13672,7 +13755,7 @@ soft_return_lobby:
             normalize_hotkey_pad_binding(
                 g_hotkey_pad_save_state_menu,
                 PSX_HOTKEY_PAD_SELECT_R1);
-        ls.aspect_index = (g_video_aspect_num * 9 == g_video_aspect_den * 21) ? 2
+        ls.aspect_index = ((int64_t)g_video_aspect_num * 9 == (int64_t)g_video_aspect_den * 21) ? 2
             : (g_video_aspect_num == 16 && g_video_aspect_den == 9) ? 1 : 0;
         ls.language_index = 0;
         for (size_t li = 0; li < lang_menu_options.size(); li++) {

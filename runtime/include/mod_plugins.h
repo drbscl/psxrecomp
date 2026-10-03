@@ -104,6 +104,13 @@ int psx_mod_set_fixed_display_aspect(uint32_t numerator,
 int psx_mod_set_adaptive_display_aspect(uint32_t max_numerator,
                                         uint32_t max_denominator);
 /*
+ * Resize-driven viewport with the original vertical FOV: Hor+ above 4:3,
+ * centered uniform crop below 4:3, full authored 4:3 for menus/FMV.
+ * Unlike the legacy adaptive API, this opt-in policy has no 4:3 lower clamp.
+ */
+int psx_mod_set_dynamic_display_aspect(uint32_t max_numerator,
+                                     uint32_t max_denominator);
+/*
  * Set the wall-clock cadence of simulated guest VBlanks. A value of zero
  * removes frontend pacing; 60 and higher request that many native guest
  * update opportunities per host second. This intentionally changes whole-

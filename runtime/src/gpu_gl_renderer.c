@@ -2602,23 +2602,43 @@ static void present_set_sharp(int mode, int tex_w, int tex_h,
  * aspect is configured the 4:3 frame is stretched into it — paired with the
  * GTE X-squash (gte_set_display_aspect) this nets a wider field of view. */
 static int s_aspect_num = 4, s_aspect_den = 3;
+static GLint s_max_viewport[2];
+static GLint s_max_texture;
 
 void gl_renderer_set_display_aspect(int num, int den) {
     if (num <= 0 || den <= 0) { num = 4; den = 3; }
+    if (num == s_aspect_num && den == s_aspect_den) return;
     s_aspect_num = num; s_aspect_den = den;
+    gl_renderer_invalidate_present();
 }
 
 /* Letterbox: largest num:den rect centered in the drawable. */
 static void letterbox_rect_aspect(int ww, int wh, int num, int den,
                                   int *x, int *y, int *w, int *h) {
-    int dw = ww, dh = (ww * den) / num;
-    if (dh > wh) { dh = wh; dw = (wh * num) / den; }
+    int64_t dw64 = ww, dh64 = ((int64_t)ww * den) / num;
+    if (dh64 > wh) { dh64 = wh; dw64 = ((int64_t)wh * num) / den; }
+    int dw = (int)dw64, dh = (int)dh64;
     *x = (ww - dw) / 2;
     *y = (wh - dh) / 2;
     *w = dw; *h = dh;
 }
 static void letterbox_rect(int ww, int wh, int *x, int *y, int *w, int *h) {
-    letterbox_rect_aspect(ww, wh, s_aspect_num, s_aspect_den, x, y, w, h);
+    if ((int64_t)s_aspect_num * 3 < (int64_t)s_aspect_den * 4) {
+        /* Full-height native 4:3 viewport clipped by the drawable: uniform
+         * pixel-aspect-correct presentation with a centered horizontal crop. */
+        *w = (int)(((int64_t)wh * 4) / 3);
+        *h = wh;
+        *x = (ww - *w) / 2;
+        *y = 0;
+    } else {
+        letterbox_rect_aspect(ww, wh, s_aspect_num, s_aspect_den, x, y, w, h);
+    }
+    if (*w > 32767 || *h > 32767 ||
+        (s_max_viewport[0] > 0 && *w > s_max_viewport[0]) ||
+        (s_max_viewport[1] > 0 && *h > s_max_viewport[1])) {
+        fprintf(stderr, "psxrecomp: unsupported presentation viewport %dx%d\n", *w, *h);
+        abort();
+    }
 }
 
 static GLuint make_tex(GLenum internal, int w, int h, GLenum fmt, GLenum type) {
@@ -2651,6 +2671,13 @@ static int make_fbo(GLuint *out_fbo, GLuint color_tex, GLuint stencil_rb) {
 
 static int init_gpu_raster(void) {
     s_scale = s_req_scale;
+    glGetIntegerv(GL_MAX_VIEWPORT_DIMS, s_max_viewport);
+    glGetIntegerv(GL_MAX_TEXTURE_SIZE, &s_max_texture);
+    if (s_scale < 1 || (int64_t)VRAM_W * s_scale > s_max_texture ||
+        (int64_t)VRAM_H * s_scale > s_max_texture) {
+        fprintf(stderr, "psxrecomp: internal render scale exceeds GL texture capacity\n");
+        return 0;
+    }
 
     s_geo_prog  = build_program(GEO_VS, GEO_FS);
     s_tex_prog  = build_program_ex(TEX_VS, TEX_FS, 1);
@@ -2963,6 +2990,8 @@ void gl_renderer_present(const uint32_t *pixels, int src_w, int src_h, int linea
     if (!s_ctx) return;
     interp_reset_history();
     int ww = 0, wh = 0; SDL_GL_GetDrawableSize(s_win, &ww, &wh);
+    if (ww <= 0 || wh <= 0 || (SDL_GetWindowFlags(s_win) & SDL_WINDOW_MINIMIZED))
+        return;
     glDisable(GL_SCISSOR_TEST);
     glViewport(0, 0, ww, wh);
     glClearColor(0.f,0.f,0.f,1.f); glClear(GL_COLOR_BUFFER_BIT);
@@ -3051,6 +3080,8 @@ void gl_renderer_present_blank(void) {
     if (!s_ctx) return;
     interp_reset_history();
     int ww = 0, wh = 0; SDL_GL_GetDrawableSize(s_win, &ww, &wh);
+    if (ww <= 0 || wh <= 0 || (SDL_GetWindowFlags(s_win) & SDL_WINDOW_MINIMIZED))
+        return;
     glDisable(GL_SCISSOR_TEST);
     glViewport(0, 0, ww, wh); glClearColor(0.f,0.f,0.f,1.f); glClear(GL_COLOR_BUFFER_BIT);
     pres_record(GL_PRES_BLANK, 0, 0, 0, 0, 0, 0, ww, wh);
@@ -3290,8 +3321,58 @@ static void glb_wide_configure(int wide_w, int offset) {
     if (!s_raster_ok) return;
     double t0 = cw_ms(); s_cw_wide_cfgs++;
     flush_tex_batch();   /* a queued batch's wide mirror targets the CURRENT surfaces */
+    flush_flat_batch();
     if (wide_w <= 0) { wide_free_all(); g_wide_w = 0; g_wide_off = 0; s_cw_wide_ms += cw_ms() - t0; return; }
-    if (wide_w != g_wide_w) wide_free_all();
+    /* The stencil-copy scratch is canonical VRAM-sized. Never allow a wider
+     * sidecar to silently truncate into it or exceed device texture limits. */
+    GLint limit = s_max_texture;
+    if (wide_w > VRAM_W || offset < 0 || (int64_t)offset * 2 >= wide_w ||
+        s_scale <= 0 || (int64_t)wide_w * s_scale > limit ||
+        (int64_t)VRAM_H * s_scale > limit) {
+        fprintf(stderr, "psxrecomp: unsupported native-wide surface %d offset %d scale %d\n",
+                wide_w, offset, s_scale);
+        abort();
+    }
+    if (wide_w != g_wide_w || offset != g_wide_off) {
+        GLuint old_fbo[WIDE_MAX_SURF], old_tex[WIDE_MAX_SURF], old_rb[WIDE_MAX_SURF];
+        int old_base[WIDE_MAX_SURF];
+        int old_width=g_wide_w*s_scale, shift=(offset-g_wide_off)*s_scale;
+        for (int i=0; i<WIDE_MAX_SURF; i++) {
+            old_fbo[i]=s_wide_fbo[i]; old_tex[i]=s_wide_tex[i]; old_rb[i]=s_wide_rb[i];
+            old_base[i]=s_wide_base[i];
+            s_wide_fbo[i]=s_wide_tex[i]=s_wide_rb[i]=0; s_wide_base[i]=-1;
+        }
+        g_wide_cur=0;
+        g_wide_w=wide_w;
+        g_wide_off=offset;
+        /* The displayed band was rendered before this VBlank resize. Translate
+         * its overlapping color/mask content into the new centered surface;
+         * only genuinely newly exposed pixels remain cleared until next draw. */
+        int sx=shift<0 ? -shift : 0, dx=shift>0 ? shift : 0;
+        int count=old_width-sx;
+        if (count>wide_w*s_scale-dx) count=wide_w*s_scale-dx;
+        glDisable(GL_SCISSOR_TEST);
+        for (int i=0; i<WIDE_MAX_SURF; i++) {
+            if (old_fbo[i]) {
+                GLuint next=wide_fbo_for(old_base[i]);
+                if (!next) {
+                    fprintf(stderr, "psxrecomp: native-wide resize allocation failed\n");
+                    abort();
+                }
+                if (count>0) {
+                    p_glBindFramebuffer(PSXGL_READ_FRAMEBUFFER,old_fbo[i]);
+                    p_glBindFramebuffer(PSXGL_DRAW_FRAMEBUFFER,next);
+                    p_glBlitFramebuffer(sx,0,sx+count,VRAM_H*s_scale,
+                                        dx,0,dx+count,VRAM_H*s_scale,
+                                        GL_COLOR_BUFFER_BIT|GL_STENCIL_BUFFER_BIT,GL_NEAREST);
+                }
+                p_glDeleteFramebuffers(1,&old_fbo[i]);
+                glDeleteTextures(1,&old_tex[i]);
+                p_glDeleteRenderbuffers(1,&old_rb[i]);
+            }
+        }
+        p_glBindFramebuffer(PSXGL_FRAMEBUFFER,0);
+    }
     g_wide_w = wide_w;
     g_wide_off = offset;
     s_cw_wide_ms += cw_ms() - t0;
@@ -3926,6 +4007,8 @@ static int interp_present(void) {
     if (a < 0.0) a = 0.0;
 
     int ww = 0, wh = 0; SDL_GL_GetDrawableSize(s_win, &ww, &wh);
+    if (ww <= 0 || wh <= 0 || (SDL_GetWindowFlags(s_win) & SDL_WINDOW_MINIMIZED))
+        return 0;
     int lx, ly, lw, lh;
     if (s_interp_force_4_3)
         letterbox_rect_aspect(ww, wh, 4, 3, &lx, &ly, &lw, &lh);
@@ -4265,6 +4348,10 @@ void gl_renderer_present_vram(int disp_x, int disp_y, int w, int h, int linear,
     }
     gl_perf_present_enter();   /* per-frame backdrop-phase reset + dbg snapshot live in here */
     int ww = 0, wh = 0; SDL_GL_GetDrawableSize(s_win, &ww, &wh);
+    if (ww <= 0 || wh <= 0 || (SDL_GetWindowFlags(s_win) & SDL_WINDOW_MINIMIZED)) {
+        gl_perf_present_exit(0);
+        return;
+    }
     int lx, ly, lw, lh;
     if (force_4_3)
         letterbox_rect_aspect(ww, wh, 4, 3, &lx, &ly, &lw, &lh);
@@ -4373,6 +4460,10 @@ int gl_renderer_present_wide_fbo(int disp_x, int disp_y, int disp_h, int linear)
     }
     gl_perf_present_enter();
     int ww = 0, wh = 0; SDL_GL_GetDrawableSize(s_win, &ww, &wh);
+    if (ww <= 0 || wh <= 0 || (SDL_GetWindowFlags(s_win) & SDL_WINDOW_MINIMIZED)) {
+        gl_perf_present_exit(1);
+        return 1;
+    }
     int lx, ly, lw, lh;
     letterbox_rect(ww, wh, &lx, &ly, &lw, &lh);
     wide_blit_center(fbo, disp_x, disp_y, disp_h);   /* fast-path: authoritative centre */

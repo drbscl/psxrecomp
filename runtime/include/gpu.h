@@ -220,6 +220,9 @@ int  gpu_ws_netplay_local_viewport_width(void);
  * full-2D menu/title screen), so the squash is suppressed and content drawn
  * pixel-native. The present path uses the same predicate to pillarbox. */
 int  gpu_ws_present_native_43(void);
+/* Enable authored-content classification even with a 4:3/off GPU projection.
+ * Used by the opt-in vertical-FOV crop policy; does not change guest geometry. */
+void gpu_ws_set_preserve_authored(int enabled);
 /* Per-side X cull-margin (screen/world units) emitted into the game's draw-
  * cull immediates by the recompiler ([widescreen.cull]); 0 unless stretching. */
 int  psx_ws_x_margin(void);

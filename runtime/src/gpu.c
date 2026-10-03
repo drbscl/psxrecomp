@@ -32,6 +32,10 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#if defined(PSX_TITLE_ACPP_DYNAMIC_ASPECT)
+#include "acpp_dynamic_cull.h"
+extern int acpp_dynamic_aspect_enabled(void);
+#endif
 
 extern uint16_t psx_read_half(uint32_t addr);
 extern uint8_t  psx_read_byte(uint32_t addr);
@@ -109,6 +113,7 @@ static uint16_t ws_ui_prepass_rank = 0xFFFFu;
 static int      ws_mode    = 0;
 static int      ws_cfg_num = 4, ws_cfg_den = 3;
 static void ws_nw_sync_target(void);
+static int ws_native_wide_configured(void);
 
 #define WS_TAG_BUCKETS 4096                  /* power of two */
 #define WS_TAG_PROBES  8
@@ -271,6 +276,12 @@ static int ws_full_2d_mode(void) {
     return ws_full_2d || env;
 }
 static int ws_game_mode(void) {
+#if defined(PSX_TITLE_ACPP_DYNAMIC_ASPECT)
+    /* Title renderer byte identity survives pause/feedback frames. Unknown
+     * overlays stay authored 4:3 rather than guessing from stale GTE activity. */
+    if (acpp_dynamic_aspect_enabled())
+        return acpp_dynamic_gameplay_scene();
+#endif
     int state_match = ws_gameplay_state_matches();
     if (state_match >= 0) return state_match;
     if (ws_full_2d_mode()) return 1;
@@ -312,8 +323,13 @@ static int ws_2d_only_scene(void) {
 static uint32_t s_ws_fmv_frame_cache = 0xFFFFFFFFu;
 static int      s_ws_fmv_cached = 0;
 
+
+static int ws_preserve_authored = 0;
+void gpu_ws_set_preserve_authored(int enabled) {
+    ws_preserve_authored = enabled ? 1 : 0;
+}
 int gpu_ws_present_native_43(void) {
-    if (!ws_engaged()) return 0;
+    if (!ws_engaged() && !ws_preserve_authored) return 0;
     if (!ws_game_mode()) return 1;                 /* full-2D screen */
     if (ws_2d_only_scene()) return 1;              /* 2D-only gameplay scene */
     uint32_t f = (uint32_t)s_frame_count;
@@ -341,14 +357,14 @@ static int ws_active(void) { return ws_configured() && !gpu_ws_present_native_43
  * on the right, and the present widens the display read by EXTRA. 0 when
  * native-wide is inactive (4:3 / boot / squash mode / FMV / full-2D). */
 int ws_native_wide_active(void) {
-    return ws_mode == 2 && !gpu_ws_present_native_43();
+    return ws_native_wide_configured() && !gpu_ws_present_native_43();
 }
 /* Cull/spawn setup often runs while a scene is loading, before the first GTE
  * frame can classify it as gameplay.  Keep that pre-render setup aware of the
  * configured native-wide viewport; presentation itself remains gated by
  * ws_native_wide_active(). */
 static int ws_native_wide_configured(void) {
-    return ws_mode == 2 && ws_cfg_num * 3 > ws_cfg_den * 4;
+    return ws_mode == 2 && (int64_t)ws_cfg_num * 3 > (int64_t)ws_cfg_den * 4;
 }
 
 static int ws_local_viewport_cfg = 0;
@@ -374,7 +390,9 @@ static int ws_local_viewport_layout(int *base_x, int *source_w,
         return 0;
 
     int src_w = (int)di.width / 2;
-    int target_w = ((int)di.height * ws_cfg_num + ws_cfg_den / 2) / ws_cfg_den;
+    int64_t target = ((int64_t)di.height * ws_cfg_num + ws_cfg_den / 2) / ws_cfg_den;
+    if (target > 1024) return 0;
+    int target_w = (int)target;
     if (target_w < src_w)
         target_w = src_w;
     int off = (target_w - src_w) / 2;
@@ -392,9 +410,9 @@ static int ws_nw_configured_offset(void) {
     int local_offset = 0;
     if (ws_local_viewport_layout(NULL, NULL, NULL, &local_offset))
         return local_offset;
-    int numr = 3 * ws_cfg_num - 4 * ws_cfg_den;
+    int64_t numr = 3LL * ws_cfg_num - 4LL * ws_cfg_den;
     int w = (int)ws_disp_w();
-    return (w * numr + 4 * ws_cfg_den) / (8 * ws_cfg_den);
+    return (int)(((int64_t)w * numr + 4LL * ws_cfg_den) / (8LL * ws_cfg_den));
 }
 static int ws_nw_offset(void) {
     if (!ws_native_wide_active()) return 0;
@@ -2425,7 +2443,13 @@ void gpu_vertical_split_debug(int *active, int *left_age, int *right_age) {
  * disable mirroring for this draw. Called when the draw env changes. */
 static void ws_nw_sync_target(void) {
     if (!ws_native_wide_active()) { gr_wide_disable_target(); return; }
-    gr_wide_configure(ws_nw_present_width(), ws_nw_offset());
+    int wide_w = ws_nw_present_width();
+    int offset = ws_nw_offset();
+    if (wide_w <= 0 || wide_w > 1024 || offset < 0) {
+        fprintf(stderr, "psxrecomp: unsupported native-wide guest display width %d\n", wide_w);
+        abort();
+    }
+    gr_wide_configure(wide_w, offset);
     int local_base = 0;
     if (ws_local_viewport_draw_target(&local_base)) {
         gr_wide_set_target(local_base);
