@@ -54,6 +54,21 @@ void gr_set_precise_triangle(int enabled,
  * perspective_texturing). q[i] is the normalized 1/z homogeneous weight at
  * vertex i. enabled == 0 restores the PS1's affine UV interpolation. */
 void gr_set_perspective_triangle(int enabled, float q0, float q1, float q2);
+/* Exact camera provenance for the NEXT triangle. z0..z2 are positive raw
+ * GTE SZ depths (absolute, not normalized). Positive projection_y is the
+ * originating GTE H; projection_x is H times its applied horizontal correction.
+ * center_x/y are originating OFX/OFY converted from 16.16 to pixels, before
+ * GPU draw offset. All three vertices must share that originating projection.
+ * valid == 0 clears qualification and zeroes the metadata. The facade clears
+ * it after each triangle and before non-triangle primitives; unsupported
+ * backends ignore it. */
+void gr_set_camera_triangle(int valid, float z0, float z1, float z2,
+                            float projection_x, float projection_y,
+                            float center_x, float center_y);
+/* Exact world positions and the originating eye for the next triangle.
+ * Invalid qualification clears it; unsupported backends ignore it. */
+void gr_set_world_triangle(int valid, const float world[9], const float eye[3],
+                           uint32_t camera_epoch);
 
 /* Primitives */
 void gr_fill_rect(int x, int y, int w, int h, uint16_t color);
@@ -199,6 +214,12 @@ typedef struct GpuRenderBackend {
      * pixel count, writes width/height to ow/oh. NULL if unsupported. */
     int  (*wide_dump_full)(uint32_t *out, int cap_pixels, int *ow, int *oh,
                            int base_x);
+    /* Optional trailing camera-provenance callback (NULL = facade no-op). */
+    void (*set_camera_triangle)(int valid, float z0, float z1, float z2,
+                                 float projection_x, float projection_y,
+                                 float center_x, float center_y);
+    void (*set_world_triangle)(int valid, const float world[9], const float eye[3],
+                               uint32_t camera_epoch);
 } GpuRenderBackend;
 
 #ifdef __cplusplus

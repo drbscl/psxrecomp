@@ -23,6 +23,18 @@ int  gl_renderer_init_context(struct SDL_Window *win);
  * Safe before or after context creation; applies live when a context exists. */
 void gl_renderer_set_swap_interval(int interval);
 
+enum {
+    GL_GRAPHICS_ORIGINAL = 0,
+    GL_GRAPHICS_ACCURATE = 1,
+    GL_GRAPHICS_PBR_PLUS = 3
+};
+/* Safe before initialization; invalid IDs (including retired 2) are ignored.
+ * Geometry/projection tracking is host-owned. */
+void gl_renderer_set_graphics_mode(int mode);
+int gl_renderer_get_graphics_mode(void);
+/* Active presentation target pixels; zero until an enhanced surface exists. */
+void gl_renderer_graphics_diag(int *mode, int *width, int *height);
+
 /* Presentation-only frame interpolation. High-refresh sub-presents blend the
  * two most recent stable display images; guest simulation timing is unchanged. */
 void gl_renderer_set_interpolation(int enabled, double host_hz, double target_hz,

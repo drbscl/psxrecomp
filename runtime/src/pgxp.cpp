@@ -9,8 +9,8 @@
  * -----
  * Every 32-bit word of guest RAM/scratchpad, every GPR (plus HI/LO), and
  * every GTE data register owns a shadow slot recording the sub-pixel screen
- * position that word carries (16.16 X/Y + projected SZ depth), the exact
- * guest word it describes (`value`), and per-half validity flags. RTPS/RTPT
+ * position that word carries (16.16 X/Y + projected SZ depth), its originating
+ * H/OFX/OFY, the exact guest word (`value`), and per-half validity flags. RTPS/RTPT
  * fill the SXY shadow FIFO with the pre-truncation projection; the
  * psx_pgxp_* hooks copy shadows along with the data (loads, stores, COP2
  * transfers, and — in cpu-mode — the arithmetic games use to repack vertex
@@ -56,9 +56,14 @@ enum {
 struct PGXPValue {
     int32_t  x16, y16;   /* sub-pixel screen coords, 16.16                    */
     uint16_t z;          /* projected SZ depth (perspective source), 0 = none */
+    uint16_t h;          /* originating projection H; 0 = unavailable         */
     uint16_t flags;
     uint32_t value;      /* the guest word this shadow describes              */
     uint32_t gen;        /* valid iff == s_gen (O(1) invalidate-all)          */
+    int32_t ofx, ofy;    /* originating projection center, signed 16.16       */
+    int32_t x_scale_num, x_scale_den; /* originating applied X correction ratio */
+    float world[3];
+    uint32_t world_epoch;
 };
 
 #define PGXP_RAM_WORDS     (0x200000u >> 2)   /* 2 MB RAM                     */
@@ -66,7 +71,7 @@ struct PGXPValue {
 #define PGXP_REG_HI        32
 #define PGXP_REG_LO        33
 
-static PGXPValue *s_ram = nullptr;            /* lazily allocated, ~10 MB     */
+static PGXPValue *s_ram = nullptr;            /* lazily allocated             */
 static PGXPValue  s_scratch[PGXP_SCRATCH_WORDS];
 static PGXPValue  s_gpr[34];                  /* 32 GPRs + HI + LO            */
 static PGXPValue  s_gte[32];                  /* GTE data registers           */
@@ -86,12 +91,22 @@ static inline void recompute_active(void) {
 
 static PGXPStats s_stats;
 
+struct WorldCamera {
+    float inverse[12];
+    uint32_t epoch;
+};
+static WorldCamera s_world_cameras[8];
+static uint32_t s_world_epoch;
+static uint32_t s_world_active;
+
 /* ------------------------------------------------------------------------- */
 /* Lifecycle                                                                  */
 /* ------------------------------------------------------------------------- */
 
 extern "C" void pgxp_invalidate_all(void) {
     if (s_suppress != 0) { s_deferred_invalidate = 1; return; }
+    s_world_active = 0;
+    for (WorldCamera &camera : s_world_cameras) camera.epoch = 0;
     if (++s_gen == 0) {
         /* generation wrapped: physically clear so stale slots can't revive */
         if (s_ram) std::memset(s_ram, 0, PGXP_RAM_WORDS * sizeof(PGXPValue));
@@ -173,6 +188,9 @@ static inline void pv_validate(PGXPValue *pv, uint32_t actual) {
  * half-merges stay keyed correctly. */
 static inline void pv_reset(PGXPValue *pv, uint32_t value) {
     pv->x16 = 0; pv->y16 = 0; pv->z = 0;
+    pv->h = 0; pv->ofx = 0; pv->ofy = 0;
+    pv->x_scale_num = 0; pv->x_scale_den = 0;
+    pv->world_epoch = 0;
     pv->flags = 0;
     pv->value = value;
     pv->gen = s_gen;
@@ -629,7 +647,9 @@ extern "C" void psx_pgxp_muldiv(struct CPUState *cpu, uint32_t instr,
 /* ------------------------------------------------------------------------- */
 
 extern "C" void pgxp_gte_push_sxy(int32_t x16, int32_t y16, uint16_t sz3,
-                                  uint32_t packed) {
+                                  uint32_t packed, uint16_t h,
+                                  int32_t ofx, int32_t ofy,
+                                  int32_t x_scale_num, int32_t x_scale_den) {
     if (!g_pgxp_active) return;
     s_stats.produced++;
     s_gte[12] = s_gte[13];
@@ -638,10 +658,66 @@ extern "C" void pgxp_gte_push_sxy(int32_t x16, int32_t y16, uint16_t sz3,
     pv->x16 = x16;
     pv->y16 = y16;
     pv->z = sz3;
+    pv->h = h;
+    pv->ofx = ofx;
+    pv->ofy = ofy;
+    pv->x_scale_num = x_scale_num;
+    pv->x_scale_den = x_scale_den;
+    pv->world_epoch = 0;
     pv->flags = (uint16_t)(PGXP_F_VXY | (sz3 != 0 ? PGXP_F_VZ : 0));
     pv->value = packed;
     pv->gen = s_gen;
     s_gte[15] = *pv;                           /* SXYP mirrors SXY2           */
+}
+
+extern "C" void pgxp_world_camera_set(int valid, const float inverse_view[12]) {
+    if (s_suppress) return;
+    s_world_active = 0;
+    if (!valid || !g_pgxp_active || !inverse_view) return;
+    if (s_world_epoch && s_world_cameras[s_world_epoch % 8].epoch == s_world_epoch &&
+        !std::memcmp(s_world_cameras[s_world_epoch % 8].inverse, inverse_view,
+                     sizeof(s_world_cameras[0].inverse))) {
+        s_world_active = s_world_epoch;
+        return;
+    }
+    if (++s_world_epoch == 0) {
+        for (WorldCamera &camera : s_world_cameras) camera.epoch = 0;
+        ++s_world_epoch;
+    }
+    WorldCamera &camera = s_world_cameras[s_world_epoch % 8];
+    for (unsigned i = 0; i < 12; ++i) camera.inverse[i] = inverse_view[i];
+    camera.epoch = s_world_epoch;
+    s_world_active = s_world_epoch;
+}
+
+extern "C" void pgxp_gte_push_world(float x, float y, float z) {
+    if (!g_pgxp_active || !s_world_active) return;
+    WorldCamera &camera = s_world_cameras[s_world_active % 8];
+    PGXPValue &pv = s_gte[14];
+    if (pv.gen != s_gen || pv.z == 0 || camera.epoch != s_world_active) return;
+    for (unsigned row = 0; row < 3; ++row) {
+        const float *m = camera.inverse + row * 4;
+        pv.world[row] = m[0]*x + m[1]*y + m[2]*z + m[3];
+    }
+    pv.world_epoch = s_world_active;
+    s_gte[15] = pv;
+}
+
+extern "C" int pgxp_load_world_word(uint32_t addr, uint32_t packed, float world[3],
+                                    float eye[3], uint32_t *epoch) {
+    if (!g_pgxp_active) return 0;
+    PGXPValue *pv = pgxp_ptr(addr);
+    if (!pv || pv->gen != s_gen || pv->value != packed ||
+        (pv->flags & (PGXP_F_VXY | PGXP_F_VZ)) != (PGXP_F_VXY | PGXP_F_VZ) ||
+        !pv->world_epoch || pv->z == 0 || pv->h == 0) return 0;
+    const WorldCamera &camera = s_world_cameras[pv->world_epoch % 8];
+    if (camera.epoch != pv->world_epoch) return 0;
+    for (unsigned i = 0; i < 3; ++i) {
+        world[i] = pv->world[i];
+        eye[i] = camera.inverse[i*4+3];
+    }
+    *epoch = pv->world_epoch;
+    return 1;
 }
 
 extern "C" int pgxp_get_gte_sxy(uint32_t index, int32_t *x16, int32_t *y16) {
@@ -759,6 +835,7 @@ extern "C" void pgxp_test_seed_gte_sxy(uint32_t index, uint32_t packed,
                                        int valid) {
     if (index >= 4) return;
     PGXPValue *pv = &s_gte[12 + index];
+    pv_reset(pv, packed);                      /* seeds lack camera provenance */
     pv->x16 = x16;
     pv->y16 = y16;
     pv->z = z;
@@ -800,4 +877,23 @@ extern "C" int pgxp_load_precise_word(uint32_t addr, uint32_t packed,
     if (y16) *y16 = pv->y16;
     if (z) *z = (pv->flags & PGXP_F_VZ) ? pv->z : 0;
     return (pv->flags & PGXP_F_VZ) && pv->z != 0;
+}
+
+extern "C" int pgxp_load_camera_word(uint32_t addr, uint32_t packed,
+                                     uint16_t *z, uint16_t *h,
+                                     int32_t *ofx, int32_t *ofy,
+                                     int32_t *x_scale_num, int32_t *x_scale_den) {
+    if (!g_pgxp_active) return 0;
+    PGXPValue *pv = pgxp_ptr(addr);
+    if (!pv || pv->gen != s_gen || pv->value != packed ||
+        (pv->flags & (PGXP_F_VXY | PGXP_F_VZ)) != (PGXP_F_VXY | PGXP_F_VZ) ||
+        pv->z == 0 || pv->h == 0 || pv->x_scale_num <= 0 || pv->x_scale_den <= 0)
+        return 0;
+    if (z) *z = pv->z;
+    if (h) *h = pv->h;
+    if (ofx) *ofx = pv->ofx;
+    if (ofy) *ofy = pv->ofy;
+    if (x_scale_num) *x_scale_num = pv->x_scale_num;
+    if (x_scale_den) *x_scale_den = pv->x_scale_den;
+    return 1;
 }

@@ -5,7 +5,7 @@
  *
  * The engine shadows every 32-bit word of guest RAM/scratchpad, every GPR,
  * and every GTE data register with the sub-pixel projection it carries
- * (screen X/Y in 16.16 plus the projected SZ depth). The GTE fills shadows at
+ * (screen X/Y in 16.16, projected SZ depth, and originating H/OFX/OFY). The GTE fills shadows at
  * RTPS/RTPT; the psx_pgxp_* hooks (pgxp_hooks.h) move them along with the
  * data; the GPU asks for the precise position of each GP0 vertex word by the
  * packet's RAM address, validated against the actual word — never guessed
@@ -51,9 +51,20 @@ void pgxp_suppress_end(void);
 /* --- GTE producer (gte.cpp) ---------------------------------------------- */
 
 /* Called at the RTPS/RTPT projection with the pre-truncation 16.16 screen
- * coordinates, the projected depth (SZ3), and the packed SXY word the guest
- * sees. Shifts the shadow FIFO exactly like push_sxy (regs 12..15). */
-void pgxp_gte_push_sxy(int32_t x16, int32_t y16, uint16_t sz3, uint32_t packed);
+ * coordinates, projected depth (SZ3), packed SXY word, and the actual
+ * originating projection registers (OFX/OFY remain signed 16.16) and applied
+ * horizontal correction ratio x_scale_num/x_scale_den.
+ * Shifts the complete shadow FIFO exactly like push_sxy (regs 12..15). */
+void pgxp_gte_push_sxy(int32_t x16, int32_t y16, uint16_t sz3, uint32_t packed,
+                        uint16_t h, int32_t ofx, int32_t ofy,
+                        int32_t x_scale_num, int32_t x_scale_den);
+
+/* Validated title-owned inverse view transform (three affine rows). A new
+ * camera epoch is retained with projected words, not read from later GTE state. */
+void pgxp_world_camera_set(int valid, const float inverse_view[12]);
+void pgxp_gte_push_world(float view_x, float view_y, float view_z);
+int pgxp_load_world_word(uint32_t addr, uint32_t packed, float world[3],
+                         float eye[3], uint32_t *camera_epoch);
 
 /* Current SXY FIFO shadow (index 0..3 selects GTE data regs 12..15).
  * Returns nonzero when the shadow is live and carries X/Y precision. */
@@ -111,6 +122,15 @@ void pgxp_store_gte_reg(uint32_t addr, uint8_t reg);
  * nonzero when the tracked word matches `packed` AND carries a depth. */
 int pgxp_load_precise_word(uint32_t addr, uint32_t packed,
                            int32_t *x16, int32_t *y16, uint16_t *z);
+
+/* Exact whole-vertex camera provenance with the same address/value/generation
+ * guards as pgxp_load_precise_word. Also rejects suppressed reads, missing
+ * projection provenance, zero SZ/H and nonpositive horizontal correction
+ * ratios. No position-cache fallback. Outputs are written only on success;
+ * OFX/OFY remain signed 16.16. */
+int pgxp_load_camera_word(uint32_t addr, uint32_t packed, uint16_t *z,
+                          uint16_t *h, int32_t *ofx, int32_t *ofy,
+                          int32_t *x_scale_num, int32_t *x_scale_den);
 
 /* --- test accessors (always compiled; trivial) ---------------------------- */
 

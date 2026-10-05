@@ -302,6 +302,16 @@ extern "C" int gte_precision_load_word(uint32_t addr, uint32_t packed,
     return pgxp_load_precise_word(addr, packed, x16, y16, z);
 }
 
+extern "C" int gte_precision_load_camera_word(uint32_t addr, uint32_t packed,
+                                               uint16_t *z, uint16_t *h,
+                                               int32_t *ofx, int32_t *ofy,
+                                               int32_t *x_scale_num,
+                                               int32_t *x_scale_den) {
+    if (s_speculative_depth != 0 || s_gte_replay_sandbox) return 0;
+    return pgxp_load_camera_word(addr, packed, z, h, ofx, ofy,
+                                 x_scale_num, x_scale_den);
+}
+
 /* Exact slot for a packed SXY pair, or -1 if it is outside the representable
  * screen range. No hashing: distinct positions never share a slot. */
 static inline int64_t geom_slot(uint32_t packed) {
@@ -846,6 +856,7 @@ void gte_rtps_internal(GTEState* gte, int16_t* V, bool setMac0, uint32_t instr) 
     // this frame is being stretched — never on a 4:3-presented frame (FMV /
     // full-2D screen), so content and present stay locked.
     int64_t xterm = (int64_t)gte->IR1 * h_div_sz;
+    int32_t projection_xnum = 1, projection_xden = 1;
     bool do_squash = (s_ws_xnum != s_ws_xden) && !gpu_ws_present_native_43();
     const bool dome_call = ws_dome_call_matches();
     // Curved backdrops are authored to cover the original 4:3 projection.
@@ -866,8 +877,11 @@ void gte_rtps_internal(GTEState* gte, int16_t* V, bool setMac0, uint32_t instr) 
             if (!s_gte_replay_sandbox) s_ws_sz_far++;
         }
     }
-    if (do_squash)
+    if (do_squash) {
         xterm = xterm * s_ws_xnum / s_ws_xden;
+        projection_xnum = s_ws_xnum;
+        projection_xden = s_ws_xden;
+    }
     // Native-wide dome expansion remains a diagnostic-only depth probe.
     else if (s_ws_dome_on && s_ws_dome_num != s_ws_dome_den &&
              !gpu_ws_present_native_43()) {
@@ -879,6 +893,8 @@ void gte_rtps_internal(GTEState* gte, int16_t* V, bool setMac0, uint32_t instr) 
         }
         if (sz >= s_ws_far_threshold) {
             xterm = xterm * s_ws_dome_num / s_ws_dome_den;
+            projection_xnum = s_ws_dome_num;
+            projection_xden = s_ws_dome_den;
             if (!s_gte_replay_sandbox) s_ws_sz_far++;
         }
     }
@@ -888,9 +904,19 @@ void gte_rtps_internal(GTEState* gte, int16_t* V, bool setMac0, uint32_t instr) 
     int64_t sx = sx16 >> 16;
     int64_t sy = sy16 >> 16;
     gte->push_sxy(sx, sy);
-    if (!s_gte_replay_sandbox)
+    if (!s_gte_replay_sandbox) {
         pgxp_gte_push_sxy((int32_t)sx16, (int32_t)sy16, gte->SZ[3],
-                          (uint32_t)gte->SXY[2]);
+                          (uint32_t)gte->SXY[2], gte->H, gte->OFX, gte->OFY,
+                          projection_xnum, projection_xden);
+        if (shift == 12 && (mac1 >> 12) == gte->IR1 &&
+            (mac2 >> 12) == gte->IR2 && mac3 > 0 &&
+            (mac3 >> 12) == gte->SZ[3] &&
+            (uint32_t)gte->H < 2u*(uint32_t)gte->SZ[3] &&
+            sx >= -1024 && sx <= 1023 && sy >= -1024 && sy <= 1023)
+            pgxp_gte_push_world((float)mac1 / 4096.0f,
+                                 (float)mac2 / 4096.0f,
+                                 (float)mac3 / 4096.0f);
+    }
     geom_note((uint32_t)gte->SXY[2], sx16, sy16);
 
     // Step 5: Depth cueing (MAC0/IR0) — only for last vertex of RTPT or RTPS

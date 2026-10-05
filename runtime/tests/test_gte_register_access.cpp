@@ -44,6 +44,7 @@ extern "C" void gte_test_execute_reference(CPUState *cpu, uint32_t cmd);
 
 /* gte.cpp runtime dependencies that are irrelevant to register-transfer tests. */
 extern "C" int gpu_ws_present_native_43(void) { return 0; }
+extern "C" int gpu_ws_precise_nclip_enabled(void) { return 0; }
 extern "C" void psx_ws_note_gte_project(int) {}
 extern "C" {
 uint64_t s_frame_count = 0;
@@ -651,6 +652,83 @@ int test_precision_speculative_transaction() {
     return 0;
 }
 
+int test_camera_projection_provenance() {
+    constexpr uint32_t address = 0x00123480u;
+    constexpr uint16_t original_h = 320, original_z = 800;
+    constexpr int32_t original_ofx = 160 * 65536 + 0x2000;
+    constexpr int32_t original_ofy = 120 * 65536 + 0x4000;
+    gte_precision_tracking_set(1);
+    gte_set_display_aspect(16, 9);
+    GTEState gte;
+    gte.RT[0][0] = gte.RT[1][1] = gte.RT[2][2] = 4096;
+    gte.V0[0] = 10;
+    gte.V0[1] = 20;
+    gte.V0[2] = original_z;
+    gte.H = original_h;
+    gte.OFX = original_ofx;
+    gte.OFY = original_ofy;
+    PSXRecomp::GTE::gte_rtps(&gte, 0x0180001u);
+    const uint32_t packed = static_cast<uint32_t>(gte.SXY[2]);
+
+    /* Change the live projection before SWC2: the stored vertex must still
+     * describe the registers that produced it, not the current camera. */
+    gte.H = 240;
+    gte.OFX = -32 * 65536 + 0x6000;
+    gte.OFY = 96 * 65536;
+    gte_set_display_aspect(4, 3);
+    gte_precision_store_word(address, 14);
+    uint16_t z = 0, h = 0;
+    int32_t ofx = 0, ofy = 0;
+    int32_t xnum = 0, xden = 0;
+    if (!gte_precision_load_camera_word(address, packed, &z, &h, &ofx, &ofy, &xnum, &xden) ||
+        z != original_z || h != original_h ||
+        ofx != original_ofx || ofy != original_ofy || xnum != 3 || xden != 4) {
+        std::fprintf(stderr, "camera provenance: got (%u,%u,%d,%d,%d/%d), expected (%u,%u,%d,%d,3/4)\n",
+                     z, h, ofx, ofy, xnum, xden, original_z, original_h, original_ofx, original_ofy);
+        return 1;
+    }
+
+    /* Subsequent projections shift their own camera with the precise FIFO. */
+    gte_set_display_aspect(16, 9);
+    gte_ws_set_suppress(1);
+    gte.V0[2] = 1200;
+    PSXRecomp::GTE::gte_rtps(&gte, 0x0180001u);
+    gte_precision_store_word(address, 13);
+    if (!gte_precision_load_camera_word(address, packed, &z, &h, &ofx, &ofy, &xnum, &xden) ||
+        z != original_z || h != original_h ||
+        ofx != original_ofx || ofy != original_ofy || xnum != 3 || xden != 4)
+        return fail_value("camera FIFO provenance", 0, 13, packed, original_h, h);
+
+    /* A far vertex in the same widescreen configuration is actually
+     * un-squashed; recording the global aspect ratio would be incorrect. */
+    const uint32_t far_packed = static_cast<uint32_t>(gte.SXY[2]);
+    gte_precision_store_word(address + 4u, 14);
+    if (!gte_precision_load_camera_word(address + 4u, far_packed,
+                                         &z, &h, &ofx, &ofy, &xnum, &xden) ||
+        z != 1200 || h != gte.H || xnum != 1 || xden != 1)
+        return fail_value("depth-gated camera projection", 0, 14, far_packed, 1, xnum);
+    gte_ws_set_suppress(0);
+    gte_set_display_aspect(4, 3);
+
+    gte_precision_speculative_begin();
+    const int speculative = gte_precision_load_camera_word(address, packed,
+                                                            nullptr, nullptr, nullptr, nullptr, nullptr, nullptr);
+    gte_precision_speculative_end();
+    if (speculative)
+        return fail_value("speculative camera read", 0, 0, packed, 0, 1);
+    gte_precision_timeline_invalidate();
+    if (gte_precision_load_camera_word(address, packed, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr))
+        return fail_value("stale camera timeline", 0, 0, packed, 0, 1);
+
+    PSXRecomp::GTE::gte_rtps(&gte, 0x0180001u);
+    const uint32_t rebuilt_packed = static_cast<uint32_t>(gte.SXY[2]);
+    gte_precision_store_word(address, 14);
+    if (!gte_precision_load_camera_word(address, rebuilt_packed, &z, &h, &ofx, &ofy, &xnum, &xden) ||
+        z != 1200 || h != gte.H || ofx != gte.OFX || ofy != gte.OFY || xnum != 1 || xden != 1)
+        return fail_value("rebuilt camera provenance", 0, 14, rebuilt_packed, gte.H, h);
+    return 0;
+}
+
 } // namespace
 
 int main() {
@@ -662,6 +740,7 @@ int main() {
     if (int rc = test_command_timing_hook()) return rc;
     if (int rc = test_precise_sxy_invalidation()) return rc;
     if (int rc = test_precision_speculative_transaction()) return rc;
+    if (int rc = test_camera_projection_provenance()) return rc;
     std::puts("PASS: canonical GTE register helpers match GTEState transfer oracle");
     return 0;
 }

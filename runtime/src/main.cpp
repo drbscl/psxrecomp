@@ -1140,6 +1140,17 @@ static int           g_video_geometry_correction   = 0;
 static int           g_video_perspective_texturing = 0;
 static int           g_video_pgxp_cpu_mode         = 0;
 static float         g_video_pgxp_tolerance        = 0.5f;
+
+/* The runtime owns configured Original corrections; title modes only add
+ * requirements and must not overwrite those saved/configured preferences. */
+extern "C" void psx_runtime_apply_graphics_corrections(int enhanced) {
+    gte_geometry_correction_set(g_video_geometry_correction || enhanced);
+    gpu_texture_correction_set(g_video_perspective_texturing || enhanced);
+    /* Truncation/provenance guards still apply. Enhanced modes retain the
+     * full [0,1) projection fraction rather than rejecting either axis >0.5. */
+    pgxp_set_tolerance(enhanced ? 1.0f : g_video_pgxp_tolerance);
+}
+
 static int           g_video_renderer = PSXRecompV4::DEFAULT_VIDEO_RENDERER;
 static std::string   g_bezel_path;      /* mod-owned OpenGL margin artwork */
 static int           g_fullscreen     = 0;  /* tri-state: 0 windowed, 1 borderless (desktop)
@@ -2630,7 +2641,7 @@ static int host_refresh_is_approx_60hz(void) {
     return g_host_refresh_hz >= 58.8 && g_host_refresh_hz <= 61.2;
 }
 
-static int present_vsync_owns_cadence(void) {
+static int original_vsync_owns_cadence(void) {
     if (g_video_vsync == 0 || g_present_vsync_disabled)
         return 0;
     if (g_frame_period_ms <= 0.0)
@@ -2640,6 +2651,17 @@ static int present_vsync_owns_cadence(void) {
     if (g_netplay_vsync_forced_off || psx_netplay_active())
         return 0;
     return host_refresh_is_approx_60hz();
+}
+
+static int present_vsync_owns_cadence(void) {
+#ifndef PSX_SDL_NO_RENDER
+    /* Enhanced modes must not let driver VSync throttle the guest. The saved
+     * mode is loaded before the GL context exists, so this must not require
+     * g_gl_active. */
+    if (gl_renderer_get_graphics_mode() != GL_GRAPHICS_ORIGINAL)
+        return 0;
+#endif
+    return original_vsync_owns_cadence();
 }
 
 static int present_effective_swap_interval(void) {
@@ -2669,6 +2691,12 @@ static void apply_present_cadence(void) {
         (void)SDL_RenderSetVSync(sdl_renderer, interval != 0 ? 1 : 0);
     latency_ring_set_present_mode(interval);
 #endif
+}
+
+/* Title graphics-mode changes alter the desired presentation interval; the
+ * saved preference must take effect in the same session. */
+extern "C" void psx_runtime_apply_present_cadence(void) {
+    apply_present_cadence();
 }
 
 static void log_present_cadence(void) {
@@ -12616,6 +12644,10 @@ session_reboot:
                      g_video_renderer == 1 ? "opengl" : "software");
     }
     gpu_init();
+    if (gl_renderer_get_graphics_mode() > 0 && gr_backend() != GR_BACKEND_OPENGL) {
+        std::fprintf(stderr, "psxrecomp: saved graphics enhancement requires OpenGL; running Original (preference retained)\n");
+        gl_renderer_set_graphics_mode(GL_GRAPHICS_ORIGINAL);
+    }
     /* Internal-resolution supersampling (SSAA). Must follow gpu_init.
      * Dual-raster: gr_set_scale(N) arms GL hr FBO @ N× while glb_set_scale
      * keeps SW at 1×. SW-only netplay: force scale 1. Offline: full SSAA. */
@@ -12660,10 +12692,8 @@ session_reboot:
         g_video_perspective_texturing = (*e && *e != '0') ? 1 : 0;
     if (const char* e = std::getenv("PSX_PGXP_CPU_MODE"))
         g_video_pgxp_cpu_mode = (*e && *e != '0') ? 1 : 0;
-    gte_geometry_correction_set(g_video_geometry_correction);
-    gpu_texture_correction_set(g_video_perspective_texturing);
+    psx_runtime_apply_graphics_corrections(gl_renderer_get_graphics_mode() > 0);
     pgxp_set_cpu_mode(g_video_pgxp_cpu_mode);
-    pgxp_set_tolerance(g_video_pgxp_tolerance);
     if (g_video_geometry_correction || g_video_perspective_texturing) {
         std::fprintf(stdout,
                      "psxrecomp: geometry correction %s, perspective texturing %s%s\n",
@@ -13055,6 +13085,11 @@ session_reboot:
         }
         if (!g_gl_active) {
             gr_set_backend(GR_BACKEND_SOFTWARE);
+            if (gl_renderer_get_graphics_mode() > 0) {
+                std::fprintf(stderr, "psxrecomp: OpenGL unavailable; running Original (graphics preference retained)\n");
+                gl_renderer_set_graphics_mode(GL_GRAPHICS_ORIGINAL);
+                psx_runtime_apply_graphics_corrections(0);
+            }
             gl_renderer_set_cpu_auth_dual(0);
             g_gl_fbo_present = 0;
             s_netplay_gl_present = 0;

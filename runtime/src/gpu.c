@@ -3227,6 +3227,64 @@ uint32_t gpu_texture_correction_hits(void) {
     return sw_perspective_triangle_count();
 }
 
+/* Camera qualification is independent of geometry/UV correction. Only whole,
+ * exact address-keyed projections qualify; the position-cache fallback never
+ * supplies depth. If depths is non-NULL, retain the existing SZ-only UV path
+ * even when originating projection metadata is missing or inconsistent. */
+static int prepare_camera_triangle(int i0, int i1, int i2, uint16_t depths[3]) {
+    gr_set_camera_triangle(0, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f);
+    if (gp0_cmd_source_addr == 0xFFFFFFFFu) return 0;
+    const int indices[3] = { i0, i1, i2 };
+    uint16_t camera_z[3];
+    uint16_t *z = depths ? depths : camera_z;
+    uint16_t projection = 0;
+    int32_t center_x = 0, center_y = 0;
+    int32_t projection_xnum = 0, projection_xden = 0;
+    int camera_valid = 1;
+    float world[9], eye[3], vertex_eye[3];
+    uint32_t epoch = 0;
+    int world_valid = 1;
+    for (int i = 0; i < 3; i++) {
+        uint32_t addr = (gp0_cmd_source_addr + (uint32_t)indices[i] * 4u) & 0x1FFFFCu;
+        uint32_t word = gp0_cmd_buf[indices[i]];
+        uint32_t vertex_epoch = 0;
+        if (!pgxp_load_world_word(addr, word, world + i*3, vertex_eye, &vertex_epoch))
+            world_valid = 0;
+        else if (i == 0) {
+            epoch = vertex_epoch;
+            for (int j = 0; j < 3; ++j) eye[j] = vertex_eye[j];
+        } else if (vertex_epoch != epoch)
+            world_valid = 0;
+        uint16_t h;
+        int32_t ofx, ofy, xnum, xden;
+        if (!gte_precision_load_camera_word(addr, word, &z[i], &h, &ofx, &ofy,
+                                             &xnum, &xden)) {
+            camera_valid = 0;
+            if (!depths || !gte_precision_load_word(addr, word, NULL, NULL, &z[i]) ||
+                z[i] == 0)
+                return 0;
+        } else if (i == 0) {
+            projection = h;
+            center_x = ofx;
+            center_y = ofy;
+            projection_xnum = xnum;
+            projection_xden = xden;
+        } else if (h != projection || ofx != center_x || ofy != center_y ||
+                   (int64_t)xnum * projection_xden != (int64_t)projection_xnum * xden) {
+            camera_valid = 0;
+        }
+    }
+    if (camera_valid)
+        gr_set_camera_triangle(1, (float)z[0], (float)z[1], (float)z[2],
+                                (float)projection * (float)projection_xnum /
+                                    (float)projection_xden, (float)projection,
+                                (float)center_x * (1.0f / 65536.0f),
+                                (float)center_y * (1.0f / 65536.0f));
+    if (camera_valid && world_valid)
+        gr_set_world_triangle(1, world, eye, epoch);
+    return 1;
+}
+
 /* Per-vertex precise positions (PGXP, ENHANCEMENTS.md G1). Each of the three
  * packet words is resolved independently: the address-keyed dataflow shadow
  * first (validated against the actual word — exact provenance, survives
@@ -3273,16 +3331,11 @@ static void prepare_precise_triangle(int i0, int i1, int i2,
  * association through ordering-table reordering and rejects CPU-built UI. */
 static void prepare_texture_triangle(int i0, int i1, int i2) {
     gr_set_perspective_triangle(0, 0.0f, 0.0f, 0.0f);
-    if (!s_texture_correction_enabled || gp0_cmd_source_addr == 0xFFFFFFFFu)
-        return;
-    int indices[3] = { i0, i1, i2 };
     uint16_t z[3];
-    for (int i = 0; i < 3; i++) {
-        uint32_t addr = (gp0_cmd_source_addr + (uint32_t)indices[i] * 4u) & 0x1FFFFCu;
-        if (!gte_precision_load_word(addr, gp0_cmd_buf[indices[i]], NULL, NULL, &z[i]) ||
-            z[i] == 0)
-            return;
-    }
+    if (!prepare_camera_triangle(i0, i1, i2,
+                                  s_texture_correction_enabled ? z : NULL) ||
+        !s_texture_correction_enabled)
+        return;
     float q[3] = { 1.0f / (float)z[0], 1.0f / (float)z[1], 1.0f / (float)z[2] };
     float qmax = q[0];
     if (q[1] > qmax) qmax = q[1];
@@ -3479,6 +3532,7 @@ static void gp0_exec_mono_tri(void) {
     }
     if (draw_area_out_bbox(vx, vy, 3)) return;
     gr_set_semi_transparency(semi_trans, (int)semi_transparency);
+    prepare_camera_triangle(1, 2, 3, NULL);
     prepare_precise_triangle(1, 2, 3,
                              vx, vy);
     gr_draw_flat_triangle(vx[0], vy[0], vx[1], vy[1], vx[2], vy[2], color);
@@ -3545,12 +3599,14 @@ static void gp0_exec_mono_quad(void) {
     if (!rej_a) {
         int32_t tx[3] = { vx[0], vx[1], vx[2] };
         int32_t ty[3] = { vy[0], vy[1], vy[2] };
+        prepare_camera_triangle(1, 2, 3, NULL);
         prepare_precise_triangle(1, 2, 3, tx, ty);
         gr_draw_flat_triangle(vx[0], vy[0], vx[1], vy[1], vx[2], vy[2], color);
     }
     if (!rej_b) {
         int32_t tx[3] = { vx[2], vx[1], vx[3] };
         int32_t ty[3] = { vy[2], vy[1], vy[3] };
+        prepare_camera_triangle(3, 2, 4, NULL);
         prepare_precise_triangle(3, 2, 4, tx, ty);
         gr_draw_flat_triangle(vx[2], vy[2], vx[1], vy[1], vx[3], vy[3], color);
     }
@@ -3574,6 +3630,7 @@ static void gp0_exec_shaded_tri(void) {
     }
     if (draw_area_out_bbox(vx, vy, 3)) return;
     gr_set_semi_transparency(semi_trans, (int)semi_transparency);
+    prepare_camera_triangle(1, 3, 5, NULL);
     prepare_precise_triangle(1, 3, 5,
                              vx, vy);
     gr_draw_gouraud_triangle(vx[0], vy[0], c[0],
@@ -3620,6 +3677,7 @@ static void gp0_exec_shaded_quad(void) {
     if (!rej_a) {
         int32_t tx[3] = { vx[0], vx[1], vx[2] };
         int32_t ty[3] = { vy[0], vy[1], vy[2] };
+        prepare_camera_triangle(1, 3, 5, NULL);
         prepare_precise_triangle(1, 3, 5, tx, ty);
         gr_draw_gouraud_triangle(vx[0], vy[0], c[0],
                                  vx[1], vy[1], c[1],
@@ -3628,6 +3686,7 @@ static void gp0_exec_shaded_quad(void) {
     if (!rej_b) {
         int32_t tx[3] = { vx[2], vx[1], vx[3] };
         int32_t ty[3] = { vy[2], vy[1], vy[3] };
+        prepare_camera_triangle(5, 3, 7, NULL);
         prepare_precise_triangle(5, 3, 7, tx, ty);
         gr_draw_gouraud_triangle(vx[2], vy[2], c[2],
                                  vx[1], vy[1], c[1],

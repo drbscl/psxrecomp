@@ -69,12 +69,15 @@ static const uint32_t PACKED  = (80u << 16) | 160u;
 static const int32_t  X16     = (160 << 16) | 0x8000;   /* 160.5  */
 static const int32_t  Y16     = (80 << 16)  | 0x4000;   /* 80.25  */
 static const uint16_t SZ3     = 100;
+static const uint16_t PROJECTION_H = 320;
+static const int32_t OFX = 160 * 65536 + 0x2000;
+static const int32_t OFY = 120 * 65536 + 0x4000;
 
 static const uint32_t ADDR_A  = 0x80100000u;   /* packet slot A (KSEG0)  */
 static const uint32_t ADDR_B  = 0x00100040u;   /* packet slot B (KUSEG)  */
 
 static void produce_at(uint32_t addr) {
-    pgxp_gte_push_sxy(X16, Y16, SZ3, PACKED);
+    pgxp_gte_push_sxy(X16, Y16, SZ3, PACKED, PROJECTION_H, OFX, OFY, 1, 1);
     psx_pgxp_cop2(nullptr, SWC2(14), PACKED, addr);
 }
 
@@ -88,10 +91,108 @@ static int lookup(uint32_t addr, uint32_t word, int32_t ix, int32_t iy,
     return r;
 }
 
+static void test_camera_provenance(void) {
+    const uint16_t new_h = 240, new_z = 400;
+    const int32_t new_ofx = -32 * 65536 + 0x6000, new_ofy = 96 * 65536;
+    uint16_t z = 0, h = 0;
+    int32_t ofx = 0, ofy = 0;
+    int32_t xnum = 0, xden = 0;
+
+    /* A later projection must not relabel a vertex still in the SXY FIFO. */
+    pgxp_gte_push_sxy(X16, Y16, SZ3, PACKED, PROJECTION_H, OFX, OFY, 3, 4);
+    pgxp_gte_push_sxy(X16, Y16, new_z, PACKED, new_h, new_ofx, new_ofy, 1, 1);
+    psx_pgxp_cop2(nullptr, SWC2(13), PACKED, ADDR_A);
+    CHECK(pgxp_load_camera_word(ADDR_A, PACKED, &z, &h, &ofx, &ofy, &xnum, &xden));
+    CHECK(z == SZ3 && h == PROJECTION_H && ofx == OFX && ofy == OFY && xnum == 3 && xden == 4);
+
+    /* Whole-word CPU copies and guest aliases retain the originating camera. */
+    psx_pgxp_load(nullptr, LW(1, 8), ADDR_A, PACKED);
+    psx_pgxp_store(nullptr, SW(1, 8), ADDR_B, PACKED);
+    CHECK(pgxp_load_camera_word(ADDR_B, PACKED, &z, &h, &ofx, &ofy, &xnum, &xden));
+    CHECK(z == SZ3 && h == PROJECTION_H && ofx == OFX && ofy == OFY && xnum == 3 && xden == 4);
+    CHECK(pgxp_load_camera_word(0xA0100000u, PACKED, &z, &h, &ofx, &ofy, &xnum, &xden));
+    CHECK(z == SZ3 && h == PROJECTION_H && ofx == OFX && ofy == OFY && xnum == 3 && xden == 4);
+    CHECK(!pgxp_load_camera_word(ADDR_A, PACKED ^ 1u, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr));
+
+    /* Even a byte-identical tracked half-write is no longer a whole vertex. */
+    psx_pgxp_store(nullptr, SH(1, 8), ADDR_B, PACKED & 0xFFFFu);
+    CHECK(!pgxp_load_camera_word(ADDR_B, PACKED, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr));
+
+    /* SZ-only provenance must continue to support UVs, but never invent H. */
+    pgxp_gte_push_sxy(X16, Y16, SZ3, PACKED, 0, OFX, OFY, 1, 1);
+    psx_pgxp_cop2(nullptr, SWC2(14), PACKED, ADDR_A);
+    CHECK(pgxp_load_precise_word(ADDR_A, PACKED, nullptr, nullptr, &z));
+    CHECK(z == SZ3);
+    CHECK(!pgxp_load_camera_word(ADDR_A, PACKED, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr));
+    pgxp_gte_push_sxy(X16, Y16, SZ3, PACKED, PROJECTION_H, OFX, OFY, 0, 1);
+    psx_pgxp_cop2(nullptr, SWC2(14), PACKED, ADDR_A);
+    CHECK(pgxp_load_precise_word(ADDR_A, PACKED, nullptr, nullptr, &z));
+    CHECK(z == SZ3);
+    CHECK(!pgxp_load_camera_word(ADDR_A, PACKED, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr));
+    pgxp_gte_push_sxy(X16, Y16, 0, PACKED, PROJECTION_H, OFX, OFY, 1, 1);
+    psx_pgxp_cop2(nullptr, SWC2(14), PACKED, ADDR_A);
+    CHECK(!pgxp_load_camera_word(ADDR_A, PACKED, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr));
+    pgxp_test_seed_gte_sxy(2, PACKED, X16, Y16, SZ3, 1);
+    psx_pgxp_cop2(nullptr, SWC2(14), PACKED, ADDR_A);
+    CHECK(!pgxp_load_camera_word(ADDR_A, PACKED, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr));
+
+    /* Replay/suppression cannot expose or overwrite authoritative metadata. */
+    produce_at(ADDR_A);
+    pgxp_suppress_begin();
+    CHECK(!pgxp_load_camera_word(ADDR_A, PACKED, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr));
+    pgxp_gte_push_sxy(X16, Y16, new_z, PACKED, new_h, new_ofx, new_ofy, 1, 1);
+    psx_pgxp_cop2(nullptr, SWC2(14), PACKED, ADDR_A);
+    pgxp_suppress_end();
+    CHECK(pgxp_load_camera_word(ADDR_A, PACKED, &z, &h, &ofx, &ofy, nullptr, nullptr));
+    CHECK(z == SZ3 && h == PROJECTION_H && ofx == OFX && ofy == OFY);
+
+    /* A rebuilt timeline requires new projections, not old same-value slots. */
+    pgxp_invalidate_all();
+    CHECK(!pgxp_load_camera_word(ADDR_A, PACKED, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr));
+    pgxp_gte_push_sxy(X16, Y16, new_z, PACKED, new_h, new_ofx, new_ofy, 1, 1);
+    psx_pgxp_cop2(nullptr, SWC2(14), PACKED, ADDR_A);
+    CHECK(pgxp_load_camera_word(ADDR_A, PACKED, &z, &h, &ofx, &ofy, nullptr, nullptr));
+    CHECK(z == new_z && h == new_h && ofx == new_ofx && ofy == new_ofy);
+}
+
+static void test_world_provenance(void) {
+    /* World reconstruction is attached when projected, not when DMA consumes
+     * the reordered packet after a later camera/object transform. */
+    const float inverse[12]={0,0,-1,3000, 0,1,0,-1476, 1,0,0,6122};
+    float later[12]; std::memcpy(later,inverse,sizeof(later)); later[3]=1000;
+    float world[3],eye[3]; uint32_t epoch=0;
+    pgxp_world_camera_set(1,inverse);
+    pgxp_gte_push_sxy(X16,Y16,SZ3,PACKED,PROJECTION_H,OFX,OFY,1,1);
+    pgxp_gte_push_world(12,24,36);
+    psx_pgxp_cop2(nullptr,SWC2(14),PACKED,ADDR_A);
+    pgxp_world_camera_set(1,later);
+    CHECK(pgxp_load_world_word(ADDR_A,PACKED,world,eye,&epoch));
+    CHECK(world[0]==2964 && world[1]==-1452 && world[2]==6134);
+    CHECK(eye[0]==3000 && eye[1]==-1476 && eye[2]==6122);
+    CHECK(!pgxp_load_world_word(ADDR_A,PACKED^1u,world,eye,&epoch));
+    psx_pgxp_store(nullptr,SB(1,8),ADDR_A,PACKED&0xffu);
+    CHECK(!pgxp_load_world_word(ADDR_A,PACKED,world,eye,&epoch));
+    pgxp_world_camera_set(0,nullptr);
+    produce_at(ADDR_A);
+    CHECK(!pgxp_load_world_word(ADDR_A,PACKED,world,eye,&epoch));
+    pgxp_world_camera_set(1,inverse);
+    pgxp_suppress_begin();
+    pgxp_world_camera_set(0,nullptr);
+    pgxp_suppress_end();
+    pgxp_gte_push_sxy(X16,Y16,SZ3,PACKED,PROJECTION_H,OFX,OFY,1,1);
+    pgxp_gte_push_world(12,24,36);
+    psx_pgxp_cop2(nullptr,SWC2(14),PACKED,ADDR_A);
+    CHECK(pgxp_load_world_word(ADDR_A,PACKED,world,eye,&epoch));
+    pgxp_invalidate_all();
+    CHECK(!pgxp_load_world_word(ADDR_A,PACKED,world,eye,&epoch));
+}
+
 int main(void) {
     pgxp_set_enabled(1);
     pgxp_set_tolerance(-1.0f);
     pgxp_set_cpu_mode(0);
+    test_camera_provenance();
+    test_world_provenance();
 
     /* --- SWC2 produce -> GPU consume (the perspective-texturing spine) --- */
     produce_at(ADDR_A);
@@ -137,7 +238,7 @@ int main(void) {
           PGXP_SRC_DATAFLOW);
 
     /* --- MFC2 -> SW (register transfer path) --- */
-    pgxp_gte_push_sxy(X16, Y16, SZ3, PACKED);
+    pgxp_gte_push_sxy(X16, Y16, SZ3, PACKED, PROJECTION_H, OFX, OFY, 1, 1);
     psx_pgxp_cop2(nullptr, MFC2(9, 14), PACKED, 0);
     psx_pgxp_store(nullptr, SW(1, 9), ADDR_B, PACKED);
     CHECK(lookup(ADDR_B, PACKED, 160, 80, nullptr, nullptr, nullptr) ==

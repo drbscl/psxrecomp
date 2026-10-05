@@ -170,10 +170,12 @@ extern int psx_slice_block_impl(CPUState* cpu, uint32_t block_addr, uint32_t bcy
 void psx_precise_slice_init_from_env(void);
 #if defined(PSX_TITLE_ACPP_DYNAMIC_ASPECT)
 void acpp_dynamic_scene_block(CPUState* cpu, uint32_t pc);
+void acpp_world_camera_block(CPUState* cpu);
 static inline void psx_title_scene_block(CPUState* cpu, uint32_t pc) {
     /* Cheap rejection on hot block/instruction paths; host owns the phase. */
     if (pc-0x8004a68cu<0x404u)
         acpp_dynamic_scene_block(cpu,pc);
+    if (pc==0x80060f8cu) acpp_world_camera_block(cpu);
 }
 #endif
 #ifdef PSX_OVERLAY_DLL_BUILD
@@ -219,6 +221,15 @@ extern void     gte_precision_speculative_begin(void);
 extern void     gte_precision_speculative_end(void);
 extern void     gte_precision_store_word(uint32_t addr, uint8_t reg);
 extern void     gte_precision_tracking_set(int enabled);
+/* Exact address/value-validated camera provenance for a projected packet word.
+ * SZ and H are raw unsigned GTE units; OFX/OFY are signed 16.16. The applied
+ * horizontal correction is x_scale_num/x_scale_den. All outputs are written
+ * only on success. Unknown, stale or suppressed records fail. */
+extern int      gte_precision_load_camera_word(uint32_t addr, uint32_t packed,
+                                                uint16_t *z, uint16_t *h,
+                                                int32_t *ofx, int32_t *ofy,
+                                                int32_t *x_scale_num,
+                                                int32_t *x_scale_den);
 /* Sub-pixel vertex precision ([video] geometry_correction). Enables the side
  * cache that retains the 16.16 projection fraction the GTE discards when it
  * saturates SXY to integer screen pixels. Guest-visible GTE state is
